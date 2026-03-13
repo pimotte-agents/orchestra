@@ -1,0 +1,15 @@
+name = "agent"
+version = "0.1.0"
+defaultTargets = ["agent"]
+
+[[require]]
+name = "Cli"
+git = "https://github.com/leanprover/lean4-cli.git"
+rev = "main"
+
+[[lean_lib]]
+name = "Agent"
+
+[[lean_exe]]
+name = "agent"
+root = "Main"
