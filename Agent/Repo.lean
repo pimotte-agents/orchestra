@@ -53,29 +53,6 @@ def ensureCloned (fork upstream : String) : IO System.FilePath := do
     runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
     return repoPath
 
-/-- Fetch upstream and create a fresh branch. -/
-def prepareBranch (repoPath : System.FilePath) (branch : String)
-    (base : String := "main") : IO Unit := do
-  runGit' #["fetch", "upstream"] repoPath
-  -- Try to checkout the branch; if it exists, reset it
-  let result ← IO.Process.output {
-    cmd := "git"
-    args := #["checkout", branch]
-    cwd := repoPath
-  }
-  if result.exitCode == 0 then
-    runGit' #["reset", "--hard", s!"upstream/{base}"] repoPath
-  else
-    runGit' #["checkout", "-b", branch, s!"upstream/{base}"] repoPath
-
-/-- Generate a branch name from a prompt string. -/
-def generateBranchName (prompt : String) : String :=
-  let cleaned := prompt.toLower
-    |>.map fun c => if c.isAlphanum || c == ' ' then c else ' '
-  let words := cleaned.trimAscii.toString.splitOn " " |>.filter (· != "")
-  let truncated := List.take 6 words
-  "agent/" ++ (List.intersperse "-" truncated |> String.join)
-
 /-- Remove all cloned repositories. -/
 def cleanup : IO Unit := do
   let base ← workDir
