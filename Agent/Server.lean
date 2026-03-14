@@ -125,8 +125,9 @@ def start (state : State) : IO (UInt16 × IO Unit) := do
   let _acceptTask ← IO.asTask (prio := .dedicated) do
     while ← running.get do
       match ← IO.wait (← server.accept).result! with
-      | .error _ => break  -- Server closed
+      | .error _ => break
       | .ok client =>
+        if !(← running.get) then break  -- shutdown wakeup, discard
         let _ ← IO.asTask (prio := .dedicated) do
           try
             handleClient state client
@@ -134,7 +135,13 @@ def start (state : State) : IO (UInt16 × IO Unit) := do
             pure ()
   let shutdown : IO Unit := do
     running.set false
-    server.cancelAccept
+    -- Make a dummy connection to unblock the accept loop.
+    -- (cancelAccept drops the promise, causing result! to panic)
+    try
+      let dummy ← Socket.new
+      let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := port }
+      let _ ← dummy.connect addr
+    catch _ => pure ()
   return (port, shutdown)
 
 end Agent.Server

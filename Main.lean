@@ -5,7 +5,7 @@ open Cli
 open Agent
 
 /-- Run a single task: clone repo, start server, launch agent. -/
-private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) : IO Unit := do
+private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool) : IO Unit := do
   IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
   -- 1. Clone / update repo
   IO.println s!"Cloning/updating {task.fork}..."
@@ -36,7 +36,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) : IO Unit 
   IO.println s!"  Server on port {port}"
   -- 4. Launch agent in sandbox
   IO.println "  Launching agent..."
-  let exitCode ← Sandbox.launchAgent repoPath task.prompt port token
+  let exitCode ← Sandbox.launchAgent repoPath task.prompt port token (debug := debug)
   IO.println s!"  Agent exited with code {exitCode}"
   -- 5. Shutdown server
   shutdown
@@ -46,6 +46,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   let taskFile := p.positionalArg! "task-file" |>.as! String
   let configPath := p.flag? "config" |>.map (·.as! String)
   let taskIdx := p.flag? "task" |>.map (·.as! Nat)
+  let debug := p.hasFlag "debug"
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
   let taskFileData ← loadTaskFile taskFile
   if taskFileData.tasks.isEmpty then
@@ -63,7 +64,7 @@ private def runHandler (p : Parsed) : IO UInt32 := do
     return 1
   for i in [:tasks.size] do
     try
-      runTask appConfig tasks[i]! i
+      runTask appConfig tasks[i]! i debug
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
   return (0 : UInt32)
@@ -79,6 +80,7 @@ private def runCmd' : Cmd := `[Cli|
   FLAGS:
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
     t, task : Nat; "Run only the task at this index (0-based)"
+    d, debug; "Print the landrun command before executing it"
 
   ARGS:
     "task-file" : String; "Path to the JSON task file"
