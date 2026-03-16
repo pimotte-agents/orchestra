@@ -33,14 +33,31 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   }
   let (port, shutdown) ← Server.start serverState
   IO.println s!"  MCP server on port {port}"
-  -- 4. Launch agent in sandbox (connects to MCP server over localhost)
-  IO.println "  Launching agent..."
+  -- 4. Run init hook and load per-repository config
+  RepoConfig.runInitIfNeeded repoPath
+  let repoConfig ← RepoConfig.loadRepoConfig repoPath
+  -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
   let systemPrompt ← loadSystemPrompt task.systemPrompt
-  let exitCode ← Sandbox.launchAgent repoPath task.prompt port token
-    (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
-    (systemPrompt := systemPrompt)
-  IO.println s!"  Agent exited with code {exitCode}"
-  -- 5. Shutdown MCP server
+  let mut sessionId : Option String := none
+  let maxAttempts := repoConfig.validation.maxRetries + 1
+  for attempt in List.range maxAttempts do
+    RepoConfig.runHook repoPath "before.sh"
+    let prompt := if attempt == 0 then task.prompt else repoConfig.validation.retryPrompt
+    let resume := if attempt == 0 then none else sessionId
+    IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
+    let (exitCode, sid) ← Sandbox.launchAgent repoPath prompt port token
+      (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
+      (systemPrompt := systemPrompt) (resume := resume)
+    IO.println s!"  Agent exited with code {exitCode}"
+    sessionId := sid
+    let valid ← RepoConfig.runValidation repoPath
+    if valid then break
+    if attempt + 1 < maxAttempts then
+      IO.println s!"  Validation failed, retrying ({attempt + 1}/{repoConfig.validation.maxRetries})..."
+    else
+      IO.eprintln s!"  Validation still failing after {repoConfig.validation.maxRetries} retries"
+  -- 6. Run after hook and shut down MCP server
+  RepoConfig.runHook repoPath "after.sh"
   shutdown
   IO.println s!"=== Task {idx} done ===\n"
 

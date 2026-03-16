@@ -59,7 +59,8 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
     (extraEnv : Array (String × Option String) := #[])
     (pluginDirs : Array String := #[])
     (subAgent : Option String := none)
-    (systemPrompt : Option String := none) : IO UInt32 := do
+    (systemPrompt : Option String := none)
+    (resume : Option String := none) : IO (UInt32 × Option String) := do
   -- Write MCP config: nc bridges claude's stdio to the JSON-RPC TCP server in the parent process.
   -- The parent process holds all secrets; the sandbox only gets a TCP connection to it.
   let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
@@ -130,6 +131,9 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   if let some content := systemPrompt then
     args := args.push "--append-system-prompt"
     args := args.push content
+  if let some sid := resume then
+    args := args.push "--resume"
+    args := args.push sid
   args := args.push "-p"
   args := args.push prompt
   if debug then
@@ -144,16 +148,19 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
     stderr := .piped
   }
   -- Stream stdout, parse stream-json events and format for display
+  let sessionIdRef ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
     repeat do
       let line ← child.stdout.getLine
       if line.isEmpty then return
-      match StreamFormat.formatEvent line with
-      | some formatted =>
-        out.putStrLn formatted
-        out.flush
+      match StreamFormat.parseEvent line with
       | none => pure ()
+      | some event =>
+        if let .init sid _ := event then
+          sessionIdRef.set (some sid)
+        out.putStrLn (StreamFormat.format event)
+        out.flush
   -- Stream stderr to console in a background thread
   let errTask ← IO.asTask (prio := .dedicated) do
     let err ← IO.getStderr
@@ -168,6 +175,6 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   let exitCode ← child.wait
   -- Clean up MCP config
   try IO.FS.removeFile mcpConfigPath catch _ => pure ()
-  return exitCode
+  return (exitCode, ← sessionIdRef.get)
 
 end Agent.Sandbox

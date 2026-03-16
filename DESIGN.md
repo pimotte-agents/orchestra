@@ -49,3 +49,30 @@ pullrequests on the upstream repository).
 
 - The coding agent should be launched inside a landrun environment with file access restricted to the
   correct subdirectory containing the repository the agent should work on.
+
+## Improvement / feature ideas
+
+- Support a `.agent` configuration folder per repository. It should support shell scripts such as
+
+  * `init.sh`: Run after cloning the repository (and should not be repeated afterwards)
+  * `before.sh`: Run this each time before launching an agent (e.g. start a development container)
+  * `validation.sh`: Run after each agent launch.
+  * `after.sh`: Run this just before finishing the task (after possible validation re-runs). Possible
+    actions could be to stop the development container.
+
+  It should also support a config file `config.json` that allows configuring the validation workflow:
+  When validation fails, with which prompt should the agent be re-launched. When re-launching an
+  agent after validation failure, resume the previous session to preserve the context.
+
+- Continue a previous session using lists of tasks that might run intertwined. For this,
+
+  * Maintain a list of launched tasks (including repo details and prompts) with their corresponding resume keys in
+    the global `.agent` repository. Every task should be assigned a unique id.
+  * Allow running a new task continuing a previous task by giving the unique id. If a new task
+    is run continuing an earlier task, the dependency relation should be stored in the task storage.
+  * Add a subcommand to query old tasks.
+  * Allow naming a series of tasks and add a command to resume a series with a prompt given on the command line.
+
+  Later, this feature should be extended to support a queue mode. For this there should be a subcommand that launches
+  a process that listens to new tasks on a queue. A further subcommand can add new tasks to the queue using the
+  established format, possibly referencing a task series name (as described above) or a task id.
