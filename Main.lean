@@ -35,7 +35,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   IO.println s!"  MCP server on port {port}"
   -- 4. Launch agent in sandbox (connects to MCP server over localhost)
   IO.println "  Launching agent..."
-  let exitCode ← Sandbox.launchAgent repoPath task.prompt port token (debug := debug)
+  let exitCode ← Sandbox.launchAgent repoPath task.prompt port token
+    (debug := debug) (pluginDirs := appConfig.pluginDirs)
   IO.println s!"  Agent exited with code {exitCode}"
   -- 5. Shutdown MCP server
   shutdown

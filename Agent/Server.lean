@@ -77,8 +77,7 @@ private def toolsList : Json :=
         ]),
         ("required", .arr #["head"])
       ])
-    ]
-    ,
+    ],
     Json.mkObj [
       ("name", "get_pr_comments"),
       ("description", "Fetch review comments on a pull request from the upstream repository."),
@@ -103,12 +102,77 @@ private def toolsList : Json :=
     ]
   ])]
 
-private def callTool (state : State) (name : String) (args : Json) : IO Json := do
+-- Types
+
+/-- A parsed and validated tool call. `parseError` carries an argument validation failure. -/
+inductive ToolCall where
+  | health
+  | refreshToken
+  | createPr (title : String) (body : String) (head : String) (base : String)
+  | getPrComments (prNumber : Nat) (unresolvedOnly : Bool) (excludeOutdated : Bool)
+  | unknown (name : String)
+  | parseError (msg : String)
+
+/-- A parsed JSON-RPC request or notification. -/
+inductive Request where
+  | initialize (id : Json)
+  | initialized
+  | toolsList (id : Json)
+  | toolsCall (id : Json) (call : ToolCall)
+  | unknown (id : Json) (method : String)
+
+-- Parsing
+
+private def parseToolCall (name : String) (args : Json) : ToolCall :=
   match name with
-  | "health" =>
+  | "health" => .health
+  | "refresh_token" => .refreshToken
+  | "create_pr" =>
+    let title := args.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
+    let body  := args.getObjValAs? String "body"  |>.toOption |>.getD ""
+    let head  := args.getObjValAs? String "head"  |>.toOption |>.getD ""
+    let base  := args.getObjValAs? String "base"  |>.toOption |>.getD "main"
+    if head.isEmpty then .parseError "missing 'head' (branch name)"
+    else .createPr title body head base
+  | "get_pr_comments" =>
+    match args.getObjVal? "pr_number" |>.toOption with
+    | none => .parseError "missing required argument: pr_number"
+    | some prNumJson =>
+      match prNumJson.getInt? |>.toOption with
+      | none => .parseError "pr_number must be an integer"
+      | some prNumInt =>
+        if prNumInt <= 0 then .parseError "pr_number must be a positive integer"
+        else
+          let unresolvedOnly  := args.getObjValAs? Bool "unresolved_only"  |>.toOption |>.getD false
+          let excludeOutdated := args.getObjValAs? Bool "exclude_outdated" |>.toOption |>.getD false
+          .getPrComments prNumInt.toNat unresolvedOnly excludeOutdated
+  | _ => .unknown name
+
+/-- Parse a JSON-RPC message into a typed `Request`.
+    Returns `none` if the message has no method field. -/
+private def parseRequest (msg : Json) : Option Request :=
+  let id     := msg.getObjVal? "id"     |>.toOption |>.getD .null
+  let params := msg.getObjVal? "params" |>.toOption |>.getD (Json.mkObj [])
+  match msg.getObjValAs? String "method" |>.toOption with
+  | none => none
+  | some method => some <| match method with
+    | "initialize"                => .initialize id
+    | "notifications/initialized" => .initialized
+    | "tools/list"                => .toolsList id
+    | "tools/call" =>
+      let toolName := params.getObjValAs? String "name"      |>.toOption |>.getD ""
+      let toolArgs := params.getObjVal?    "arguments"        |>.toOption |>.getD (Json.mkObj [])
+      .toolsCall id (parseToolCall toolName toolArgs)
+    | _ => .unknown id method
+
+-- Evaluation
+
+private def evalToolCall (state : State) (call : ToolCall) : IO Json := do
+  match call with
+  | .health =>
     log "tool health"
     return toolContent "ok"
-  | "refresh_token" =>
+  | .refreshToken =>
     log "tool refresh_token: creating new installation token"
     try
       let jwt ← GitHub.createJWT state.appId state.privateKeyPath
@@ -119,17 +183,10 @@ private def callTool (state : State) (name : String) (args : Json) : IO Json := 
     catch e =>
       log s!"tool refresh_token: error: {e}"
       return toolContent (toString e) (isError := true)
-  | "create_pr" =>
+  | .createPr title body head base =>
     if !state.allowPR then
       log "tool create_pr: denied (fork-only mode)"
       return toolContent "PR creation not allowed in fork-only mode" (isError := true)
-    let title := args.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
-    let body := args.getObjValAs? String "body" |>.toOption |>.getD ""
-    let head := args.getObjValAs? String "head" |>.toOption |>.getD ""
-    let base := args.getObjValAs? String "base" |>.toOption |>.getD "main"
-    if head.isEmpty then
-      log "tool create_pr: error: missing 'head'"
-      return toolContent "missing 'head' (branch name)" (isError := true)
     if state.pat.isEmpty then
       log "tool create_pr: error: PAT not configured"
       return toolContent "github.pat not set in config" (isError := true)
@@ -143,27 +200,18 @@ private def callTool (state : State) (name : String) (args : Json) : IO Json := 
     catch e =>
       log s!"tool create_pr: error: {e}"
       return toolContent (toString e) (isError := true)
-  | "get_pr_comments" =>
-    let some prNumJson := args.getObjVal? "pr_number" |>.toOption
-      | return toolContent "missing required argument: pr_number" (isError := true)
-    let some prNumInt := prNumJson.getInt? |>.toOption
-      | return toolContent "pr_number must be an integer" (isError := true)
-    if prNumInt <= 0 then
-      return toolContent "pr_number must be a positive integer" (isError := true)
-    let prNumber := prNumInt.toNat
-    let unresolvedOnly := args.getObjValAs? Bool "unresolved_only" |>.toOption |>.getD false
-    let excludeOutdated := args.getObjValAs? Bool "exclude_outdated" |>.toOption |>.getD false
+  | .getPrComments prNumber unresolvedOnly excludeOutdated =>
     log s!"tool get_pr_comments: pr={prNumber} unresolved_only={unresolvedOnly} \
       exclude_outdated={excludeOutdated}"
     try
       let response ← GitHub.getPrReviewThreads state.upstream prNumber state.pat
       let threads :=
-        response.getObjVal? "data" |>.toOption
-        |>.bind (·.getObjVal? "repository" |>.toOption)
+        response.getObjVal? "data"          |>.toOption
+        |>.bind (·.getObjVal? "repository"  |>.toOption)
         |>.bind (·.getObjVal? "pullRequest" |>.toOption)
         |>.bind (·.getObjVal? "reviewThreads" |>.toOption)
-        |>.bind (·.getObjVal? "nodes" |>.toOption)
-        |>.bind (·.getArr? |>.toOption)
+        |>.bind (·.getObjVal? "nodes"       |>.toOption)
+        |>.bind (·.getArr?                  |>.toOption)
         |>.getD #[]
       let mut lines : Array String := #[]
       let mut shown := 0
@@ -176,14 +224,16 @@ private def callTool (state : State) (name : String) (args : Json) : IO Json := 
         shown := shown + 1
         let mut tags : Array String := #[]
         if !isResolved then tags := tags.push "unresolved"
-        if isResolved then tags := tags.push "resolved"
-        if isOutdated then tags := tags.push "outdated"
-        let tagStr := if tags.isEmpty then "" else s!" ({String.join (tags.toList.intersperse ", ")})"
+        if isResolved  then tags := tags.push "resolved"
+        if isOutdated  then tags := tags.push "outdated"
+        let tagStr :=
+          if tags.isEmpty then ""
+          else s!" ({String.join (tags.toList.intersperse ", ")})"
         lines := lines.push s!"--- Thread {shown}{tagStr}"
         let comments :=
           thread.getObjVal? "comments" |>.toOption
           |>.bind (·.getObjVal? "nodes" |>.toOption)
-          |>.bind (·.getArr? |>.toOption)
+          |>.bind (·.getArr?            |>.toOption)
           |>.getD #[]
         for comment in comments do
           let path   := comment.getObjValAs? String "path" |>.toOption |>.getD ""
@@ -193,7 +243,7 @@ private def callTool (state : State) (name : String) (args : Json) : IO Json := 
             |>.getD "unknown"
           let lineStr := match comment.getObjValAs? Nat "line" |>.toOption with
             | some l => s!":{l}"
-            | none => ""
+            | none   => ""
           lines := lines.push s!"  @{author} — {path}{lineStr}"
           for bodyLine in body.splitOn "\n" do
             lines := lines.push s!"    {bodyLine}"
@@ -207,31 +257,29 @@ private def callTool (state : State) (name : String) (args : Json) : IO Json := 
     catch e =>
       log s!"tool get_pr_comments: error: {e}"
       return toolContent (toString e) (isError := true)
-  | _ =>
+  | .unknown name =>
     log s!"tool {name}: unknown"
     return toolContent s!"unknown tool: {name}" (isError := true)
+  | .parseError msg =>
+    log s!"tool call error: {msg}"
+    return toolContent msg (isError := true)
 
-/-- Dispatch a JSON-RPC message. Returns Some response, or None for notifications. -/
-private def handleMessage (state : State) (msg : Json) : IO (Option Json) := do
-  let id := msg.getObjVal? "id" |>.toOption |>.getD .null
-  let some method := msg.getObjValAs? String "method" |>.toOption | return none
-  let params := msg.getObjVal? "params" |>.toOption |>.getD (Json.mkObj [])
-  match method with
-  | "initialize" =>
+/-- Evaluate a parsed JSON-RPC request. Returns `some` response, or `none` for notifications. -/
+private def evalRequest (state : State) (req : Request) : IO (Option Json) := do
+  match req with
+  | .initialize id =>
     log "initialize"
     return some (jsonrpcResult id initializeResult)
-  | "notifications/initialized" =>
+  | .initialized =>
     log "initialized"
     return none
-  | "tools/list" =>
+  | .toolsList id =>
     log "tools/list"
     return some (jsonrpcResult id toolsList)
-  | "tools/call" =>
-    let toolName := params.getObjValAs? String "name" |>.toOption |>.getD ""
-    let toolArgs := params.getObjVal? "arguments" |>.toOption |>.getD (Json.mkObj [])
-    let result ← callTool state toolName toolArgs
+  | .toolsCall id call =>
+    let result ← evalToolCall state call
     return some (jsonrpcResult id result)
-  | _ =>
+  | .unknown id method =>
     log s!"unknown method: {method}"
     return some (jsonrpcError id (-32601) s!"method not found: {method}")
 
@@ -266,10 +314,13 @@ private def handleClient (state : State) (client : Socket) : IO Unit := do
         match Json.parse trimmed with
         | .error _ => pure ()
         | .ok msg =>
-          match ← handleMessage state msg with
+          match parseRequest msg with
           | none => pure ()
-          | some response =>
-            let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
+          | some req =>
+            match ← evalRequest state req with
+            | none => pure ()
+            | some response =>
+              let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
 
 /-- Start the MCP server. Returns (port, shutdown action). -/
 def start (state : State) : IO (UInt16 × IO Unit) := do

@@ -40,6 +40,7 @@ structure AppConfig where
   privateKeyPath : String
   installationId : Option Nat := none
   pat : String := ""
+  pluginDirs : Array String := #[]
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -52,7 +53,8 @@ instance : FromJson AppConfig where
       let gh ← j.getObjVal? "github"
       gh.getObjValAs? String "pat"
     ) |>.toOption |>.getD ""
-    return { appId, privateKeyPath, installationId, pat }
+    let pluginDirs := j.getObjValAs? (Array String) "plugin_dirs" |>.toOption |>.getD #[]
+    return { appId, privateKeyPath, installationId, pat, pluginDirs }
 
 structure TaskFile where
   tasks : Array Task
