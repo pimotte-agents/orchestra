@@ -26,6 +26,7 @@ structure Task where
   mode : TaskMode
   prompt : String
   agent : Option String := none
+  systemPrompt : Option String := none
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -35,7 +36,8 @@ instance : FromJson Task where
     let mode ← j.getObjValAs? TaskMode "mode"
     let prompt ← j.getObjValAs? String "prompt"
     let agent := j.getObjValAs? String "agent" |>.toOption
-    return { upstream, fork, mode, prompt, agent }
+    let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
+    return { upstream, fork, mode, prompt, agent, systemPrompt }
 
 structure AppConfig where
   appId : Nat
@@ -89,5 +91,17 @@ def loadAppConfig (path : Option System.FilePath := none) : IO AppConfig := do
 
 def loadTaskFile (path : System.FilePath) : IO TaskFile :=
   loadJsonFile TaskFile path
+
+/--
+Load a system prompt from `~/.agent/prompts/<name>.md`.
+If `name` is `none`, reads `default.md`. Returns `none` if the file does not exist.
+-/
+def loadSystemPrompt (name : Option String := none) : IO (Option String) := do
+  let promptName := name.getD "default"
+  let promptPath ← expandHome s!"~/.agent/prompts/{promptName}.md"
+  if ← promptPath.pathExists then
+    return some (← IO.FS.readFile promptPath)
+  else
+    return none
 
 end Agent
