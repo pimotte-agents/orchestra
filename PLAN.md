@@ -1,136 +1,272 @@
-# Implementation Plan: Per-Repository `.agent` Hooks and Validation Loop
+# Implementation Plan: Task Persistence and Session Continuity
 
 ## Overview
 
-Add support for a `.agent/` configuration directory inside each cloned repository.
-This directory may contain shell scripts that are run at defined points in the task
-lifecycle, and an optional `config.json` that controls the validation retry workflow.
+Add a persistent task store so every agent run is recorded with a unique ID and its
+Claude session ID. This enables:
+- Continuing a previous session by ID (`--continues`)
+- Grouping related runs into a named series
+- Resuming the latest run in a series with a new prompt (`agent resume`)
+- Querying task history (`agent tasks`, `agent task <id>`, `agent series`)
 
-## Per-Repository `.agent/` Directory
+The queue-mode extension described in DESIGN.md is out of scope for this plan.
 
-Scripts are run with the repository root as the working directory, outside the sandbox,
-with full access to the host environment (Docker, build systems, etc.).
+---
 
-| File | When | Notes |
-|------|------|-------|
-| `init.sh` | Once, after first clone | Guarded by `.agent/.initialized` marker file |
-| `before.sh` | Before every agent launch (initial + retries) | |
-| `validation.sh` | After every agent launch | Exit 0 = pass, non-zero = fail |
-| `after.sh` | Once, after the validation loop ends | Runs even if retries exhausted |
-| `config.json` | Loaded at task start | Configures retry prompt and max retries |
+## Data Model
 
-### `.agent/config.json` Schema
+### Task Record
+
+Every call to `runTask` creates one record stored at
+`~/.agent/tasks/<id>.json`:
 
 ```json
 {
-  "validation": {
-    "retry_prompt": "Validation failed. Please review the issues and fix them.",
-    "max_retries": 3
-  }
+  "id":             "0123456789abcdef",
+  "created_at":     "2024-01-15T14:30:00Z",
+  "upstream":       "leanprover-community/mathlib4",
+  "fork":           "mybot/mathlib4",
+  "mode":           "pr",
+  "prompt":         "Fix the sorry in Algebra.Group.Defs",
+  "session_id":     "abc123...",
+  "status":         "completed",
+  "continues_from": "fedcba9876543210",
+  "series":         "mathlib-fixes"
 }
 ```
 
-Both fields are optional. Defaults: `max_retries = 3`, `retry_prompt = "..."`.
+`continues_from` and `series` are omitted when not applicable.
+`session_id` is omitted until the agent emits its `init` event and is updated
+after the run completes.
+`status` is one of `"running"`, `"completed"`, `"failed"`.
 
-If `validation.sh` is absent, the agent runs exactly once (no retries possible) and
-`after.sh` runs immediately after.
+### Series Pointer
 
-## Task Execution Flow (updated)
+`~/.agent/series/<name>.json` holds a single pointer to the latest task in
+the series:
 
-```
-1.  ensureCloned            — clone repo if needed
-2.  runInitIfNeeded         — run init.sh once (guarded by .agent/.initialized marker)
-3.  createJWT / token       — GitHub App auth
-4.  startMcpServer          — bind TCP server
-5.  loadRepoConfig          — read .agent/config.json (defaults if absent)
-6.  loadSystemPrompt        — read system prompt file
-
-    Loop (attempt 0..maxRetries):
-      a. runHook "before.sh"
-      b. launchAgent         — initial prompt on attempt 0, retry_prompt + --resume on retries
-      c. capture session_id  — from stream-json init event (for potential resume)
-      d. runValidation       — run validation.sh; if absent → treated as passed
-      e. if passed → break
-
-7.  runHook "after.sh"
-8.  shutdown MCP server
+```json
+{ "latest_task_id": "0123456789abcdef" }
 ```
 
-## Changes Required
+Updated atomically (write temp file, rename) after each run that belongs to
+the series.
 
-### 1. New file: `Agent/RepoConfig.lean`
+### Task ID Format
 
-**Types:**
+A 16-character lowercase hex string derived from `IO.monoNanosNow` (a
+monotonically increasing `UInt64` nanosecond counter). Lexicographically
+sortable, globally unique within a single machine.
+
+---
+
+## File System Layout (additions)
+
+```
+~/.agent/
+  tasks/
+    0123456789abcdef.json   ← one file per task run
+    ...
+  series/
+    mathlib-fixes.json      ← series pointer files
+    ...
+```
+
+---
+
+## New Module: `Agent/TaskStore.lean`
+
+### Types
 
 ```lean
-structure ValidationConfig where
-  retryPrompt : String
-  maxRetries  : Nat
+inductive TaskStatus where
+  | running | completed | failed
 
-structure RepoConfig where
-  validation : ValidationConfig
+structure TaskRecord where
+  id           : String
+  createdAt    : String         -- ISO 8601, from `date -u +%Y-%m-%dT%H:%M:%SZ`
+  upstream     : String
+  fork         : String
+  mode         : TaskMode
+  prompt       : String
+  sessionId    : Option String  := none
+  status       : TaskStatus     := .running
+  continuesFrom : Option String := none
+  series       : Option String  := none
 ```
 
-**Functions:**
+### Functions
 
-- `loadRepoConfig (repoPath : System.FilePath) : IO RepoConfig`
-  — Reads `.agent/config.json`; returns defaults if absent or field missing.
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `tasksDir` | `IO System.FilePath` | `~/.agent/tasks/` |
+| `seriesDir` | `IO System.FilePath` | `~/.agent/series/` |
+| `generateId` | `IO String` | 16-char hex from `IO.monoNanosNow` |
+| `saveTask` | `TaskRecord → IO Unit` | Write `tasks/<id>.json` |
+| `loadTask` | `String → IO (Option TaskRecord)` | Load by ID; `none` if missing |
+| `loadAllTasks` | `IO (Array TaskRecord)` | Load all records, sorted by ID descending |
+| `latestInSeries` | `String → IO (Option String)` | Read series pointer → task ID |
+| `updateSeriesPointer` | `String → String → IO Unit` | Write series pointer atomically |
 
-- `runHook (repoPath : System.FilePath) (name : String) : IO Unit`
-  — Runs `.agent/<name>` with `repoPath` as cwd if the file exists and is executable.
-  — Streams stdout/stderr to the console. Throws if exit code is non-zero.
+`saveTask` and `updateSeriesPointer` write atomically: write to `<path>.tmp`,
+then rename.
 
-- `runInitIfNeeded (repoPath : System.FilePath) : IO Unit`
-  — If `.agent/.initialized` does not exist: runs `init.sh` via `runHook`, then writes
-    the marker file.
+`ToJson`/`FromJson` instances are derived for `TaskStatus` and `TaskRecord`.
 
-- `runValidation (repoPath : System.FilePath) : IO Bool`
-  — Runs `.agent/validation.sh`. Returns `true` if it passes (exit 0) or is absent,
-    `false` if it exits non-zero. Does not throw on failure.
+---
 
-### 2. Modified: `Agent/Sandbox.lean`
+## Modified: `Agent/Sandbox.lean`
 
-- Add `resume : Option String := none` parameter to `launchAgent`.
-  When set, passes `--resume <session_id>` to claude.
+No changes needed — `resume : Option String` and the `(UInt32 × Option String)`
+return type were already added in the previous feature.
 
-- Change return type from `IO UInt32` to `IO (UInt32 × Option String)`.
-  The second element is the session ID captured from the `Event.init` stream event.
+---
 
-- In the stdout processing loop, when `StreamFormat.parseEvent` returns `Event.init`,
-  store the session ID in an `IO.Ref` and include it in the return value.
+## Modified: `Agent/Basic.lean` / `Agent.lean`
 
-### 3. Modified: `Agent/Basic.lean` (or `Agent.lean`)
+Add `import Agent.TaskStore` to `Agent.lean`.
 
-- Add `import Agent.RepoConfig` so it is re-exported from the `Agent` namespace.
+---
 
-### 4. Modified: `Main.lean`
+## Modified: `Main.lean`
 
-Replace the single `launchAgent` call in `runTask` with the validation loop:
+### `runTask` signature extension
 
-```
-let repoConfig ← loadRepoConfig repoPath
-runInitIfNeeded repoPath
-let mut sessionId : Option String := none
-let maxRetries := repoConfig.validation.maxRetries
-for attempt in List.range (maxRetries + 1) do
-  runHook repoPath "before.sh"
-  let prompt := if attempt == 0 then task.prompt else repoConfig.validation.retryPrompt
-  let resume := if attempt == 0 then none else sessionId
-  let (exitCode, sid) ← Sandbox.launchAgent ... prompt ... (resume := resume) ...
-  sessionId := sid
-  let valid ← runValidation repoPath
-  if valid then break
-  if attempt == maxRetries then
-    IO.eprintln s!"Task {idx}: validation still failing after {maxRetries} retries"
-runHook repoPath "after.sh"
+```lean
+private def runTask
+    (appConfig    : AppConfig)
+    (task         : Task)
+    (idx          : Nat)
+    (debug        : Bool)
+    (continuesFrom : Option String := none)
+    (series        : Option String := none) : IO Unit
 ```
 
-## Files Touched
+### `runTask` body changes
 
-| File | Change |
-|------|--------|
-| `Agent/RepoConfig.lean` | **New** |
-| `Agent/Basic.lean` | Add import |
-| `Agent/Sandbox.lean` | New `resume` param; return `(UInt32 × Option String)` |
-| `Main.lean` | Replace single launch with validation loop |
-| `Agent.lean` | Add export if needed |
+**Before the validation loop**, insert:
+
+1. Generate a task ID: `let taskId ← TaskStore.generateId`
+2. Resolve initial resume ID: if `continuesFrom` is `some prevId`, load
+   `TaskStore.loadTask prevId` and extract `sessionId` → `initialResume`.
+   If the referenced task doesn't exist or has no session ID, warn and
+   set `initialResume := none`.
+3. Create and save the initial task record (status `running`).
+
+**In the validation loop**, change the resume logic so that the first attempt
+uses `initialResume` (from `continuesFrom`) rather than `none`:
+
+```lean
+let resume := if attempt == 0 then initialResume else sessionId
+```
+
+**After the validation loop**, update the record with the final session ID
+and status (`completed` or `failed` — treat exhausted retries as
+`completed` since the agent did run).
+
+**After `after.sh`**, if `series` is `some name`:
+- `TaskStore.updateSeriesPointer name taskId`
+
+### `runHandler` changes
+
+Read two new flags from `Parsed`:
+- `--continues <id>` (optional `String`)
+- `--series <name>` (optional `String`)
+
+When `--continues` is set and `--task` is not set and the task file has more
+than one task, emit an error: `--continues requires --task when the file has
+multiple tasks`.
+
+Pass `continuesFrom` and `series` through to each `runTask` call.
+
+### New subcommand handlers
+
+#### `tasksHandler`
+
+```
+agent tasks [--limit N]
+```
+
+Load all task records via `TaskStore.loadAllTasks`.
+Print a table (most recent first):
+
+```
+ID               CREATED              FORK                        STATUS     SERIES
+0123456789abcdef 2024-01-15T14:30:00Z mybot/mathlib4              completed  mathlib-fixes
+```
+
+`--limit N` (default 20) caps the number of rows.
+
+#### `taskShowHandler`
+
+```
+agent task <id>
+```
+
+Load the record by ID. Print all fields. If not found, error.
+
+#### `seriesHandler`
+
+```
+agent series
+```
+
+List all series files in `~/.agent/series/`, printing each series name and its
+latest task ID and status.
+
+#### `resumeHandler`
+
+```
+agent resume <series-name> --prompt "..."
+```
+
+1. `TaskStore.latestInSeries seriesName` → `prevId`
+2. `TaskStore.loadTask prevId` → `prevRecord`
+3. Construct a `Task` inheriting `fork`, `upstream`, `mode` from `prevRecord`,
+   with `prompt` from the flag, and `agent`/`systemPrompt` defaults.
+4. Load `AppConfig` (with optional `--config` flag).
+5. Call `runTask appConfig task 0 debug (continuesFrom := prevId) (series := seriesName)`.
+
+---
+
+## New CLI Commands
+
+```
+agent tasks [--limit N]          List recent task runs
+agent task <id>                  Show details of one task run
+agent series                     List all task series
+agent resume <series> -p <text>  Resume latest task in a series
+```
+
+### `run` command flag additions
+
+```
+--continues <id>   Resume the Claude session of a previous task
+--series <name>    Add this run to a named task series
+```
+
+---
+
+## Updated `agentCmd` SUBCOMMANDS
+
+```lean
+SUBCOMMANDS:
+  runCmd';
+  mcpServerCmd;
+  prepareCmd;
+  cleanupCmd;
+  tasksCmd;
+  taskCmd;
+  seriesCmd;
+  resumeCmd
+```
+
+---
+
+## Implementation Order
+
+1. `Agent/TaskStore.lean` — types, JSON instances, storage functions
+2. `Agent.lean` — add import
+3. `Main.lean` — extend `runTask` + `runHandler`
+4. `Main.lean` — add `tasksCmd`, `taskCmd`, `seriesCmd`, `resumeCmd` handlers and commands
+5. Build and verify
