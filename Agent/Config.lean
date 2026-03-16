@@ -39,7 +39,7 @@ structure AppConfig where
   appId : Nat
   privateKeyPath : String
   installationId : Option Nat := none
-  patEnvVar : String := "GITHUB_PAT"
+  pat : String := ""
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -48,11 +48,11 @@ instance : FromJson AppConfig where
     let appId ← ghApp.getObjValAs? Nat "app_id"
     let privateKeyPath ← ghApp.getObjValAs? String "private_key_path"
     let installationId := ghApp.getObjValAs? Nat "installation_id" |>.toOption
-    let patEnvVar := (do
+    let pat := (do
       let gh ← j.getObjVal? "github"
-      gh.getObjValAs? String "pat_env"
-    ) |>.toOption |>.getD "GITHUB_PAT"
-    return { appId, privateKeyPath, installationId, patEnvVar }
+      gh.getObjValAs? String "pat"
+    ) |>.toOption |>.getD ""
+    return { appId, privateKeyPath, installationId, pat }
 
 structure TaskFile where
   tasks : Array Task

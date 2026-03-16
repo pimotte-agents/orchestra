@@ -2,6 +2,11 @@ import Lean.Data.Json
 
 open Lean (Json)
 
+/-
+TODO: Refactor this file as follows: Define a type of log messages and implement parsing this type
+of log messages from `JSON`. Then add a function that formats a message.
+-/
+
 namespace Agent.StreamFormat
 
 private def truncate (s : String) (n : Nat := 150) : String :=

@@ -1,8 +1,9 @@
 import Lean.Data.Json
 import Std.Internal.UV.TCP
 import Std.Net
+import Agent.GitHub
 
-open Lean (Json FromJson ToJson)
+open Lean (Json)
 open Std.Net
 open Std.Internal.UV.TCP
 
@@ -13,133 +14,202 @@ structure State where
   upstream : String
   fork : String
   allowPR : Bool
-  refreshToken : IO String
+  appId : Nat
+  privateKeyPath : String
+  installationId : Nat
+  pat : String
 
-/-- Parse a minimal HTTP request and return (method, path, body). -/
-private def parseHttpRequest (raw : String) : Option (String × String × String) := do
-  let lines := raw.splitOn "\r\n"
-  let requestLine ← lines[0]?
-  let parts := requestLine.splitOn " "
-  let method ← parts[0]?
-  let path ← parts[1]?
-  -- Find body after empty line
-  let body := match raw.splitOn "\r\n\r\n" with
-    | [_, b] => b
-    | _ => ""
-  return (method, path, body)
+private def log (msg : String) : IO Unit := do
+  let err ← IO.getStderr
+  err.putStrLn s!"[mcp] {msg}"
+  err.flush
 
-private def httpResponse (status : String) (body : String) : String :=
-  s!"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {body.length}\r\nConnection: close\r\n\r\n{body}"
+-- JSON-RPC helpers
 
-private def okResponse (data : Json := .mkObj []) : String :=
-  let body := (Json.mkObj [("ok", true), ("result", data)]).compress
-  httpResponse "200 OK" body
+private def jsonrpcResult (id : Json) (result : Json) : Json :=
+  Json.mkObj [("jsonrpc", "2.0"), ("id", id), ("result", result)]
 
-private def errorResponse (status : String) (msg : String) : String :=
-  let body := (Json.mkObj [("ok", false), ("error", .str msg)]).compress
-  httpResponse status body
+private def jsonrpcError (id : Json) (code : Int) (msg : String) : Json :=
+  Json.mkObj [
+    ("jsonrpc", "2.0"),
+    ("id", id),
+    ("error", Json.mkObj [("code", .num ⟨code, 0⟩), ("message", .str msg)])
+  ]
 
-/-- Handle a single HTTP request. Returns the response string. -/
-private def handleRequest (state : State) (method path body : String) : IO String := do
-  match method, path with
-  | "GET", "/health" =>
-    return okResponse
-  | "POST", "/refresh-token" =>
-    let token ← state.refreshToken
-    return okResponse (.str token)
-  | "POST", "/create-pr" =>
+private def toolContent (text : String) (isError : Bool := false) : Json :=
+  Json.mkObj [
+    ("content", .arr #[Json.mkObj [("type", "text"), ("text", .str text)]]),
+    ("isError", isError)
+  ]
+
+private def initializeResult : Json :=
+  Json.mkObj [
+    ("protocolVersion", "2024-11-05"),
+    ("capabilities", Json.mkObj [("tools", Json.mkObj [])]),
+    ("serverInfo", Json.mkObj [("name", "agent"), ("version", "0.1.0")])
+  ]
+
+private def toolsList : Json :=
+  Json.mkObj [("tools", .arr #[
+    Json.mkObj [
+      ("name", "health"),
+      ("description", "Check that the agent MCP server is running."),
+      ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
+    ],
+    Json.mkObj [
+      ("name", "refresh_token"),
+      ("description", "Refresh the GitHub App installation token and reconfigure the gh CLI."),
+      ("inputSchema", Json.mkObj [("type", "object"), ("properties", Json.mkObj [])])
+    ],
+    Json.mkObj [
+      ("name", "create_pr"),
+      ("description", "Create a pull request on the upstream repository."),
+      ("inputSchema", Json.mkObj [
+        ("type", "object"),
+        ("properties", Json.mkObj [
+          ("title", Json.mkObj [("type", "string")]),
+          ("body", Json.mkObj [("type", "string")]),
+          ("head", Json.mkObj [
+            ("type", "string"),
+            ("description", "Branch name in the fork.")
+          ]),
+          ("base", Json.mkObj [("type", "string")])
+        ]),
+        ("required", .arr #["head"])
+      ])
+    ]
+  ])]
+
+private def callTool (state : State) (name : String) (args : Json) : IO Json := do
+  match name with
+  | "health" =>
+    log "tool health"
+    return toolContent "ok"
+  | "refresh_token" =>
+    log "tool refresh_token: creating new installation token"
+    try
+      let jwt ← GitHub.createJWT state.appId state.privateKeyPath
+      let token ← GitHub.createInstallationToken jwt state.installationId
+      GitHub.setupGhAuth token
+      log "tool refresh_token: ok"
+      return toolContent token
+    catch e =>
+      log s!"tool refresh_token: error: {e}"
+      return toolContent (toString e) (isError := true)
+  | "create_pr" =>
     if !state.allowPR then
-      return errorResponse "403 Forbidden" "PR creation not allowed in fork-only mode"
-    match Json.parse body with
-    | .error e => return errorResponse "400 Bad Request" s!"invalid JSON: {e}"
-    | .ok j =>
-      let title := j.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
-      let prBody := j.getObjValAs? String "body" |>.toOption |>.getD ""
-      let head := j.getObjValAs? String "head" |>.toOption |>.getD ""
-      let base := j.getObjValAs? String "base" |>.toOption |>.getD "main"
-      if head == "" then
-        return errorResponse "400 Bad Request" "missing 'head' (branch name)"
-      let ghPat ← IO.getEnv "GITHUB_PAT"
-      let ghPat := ghPat.getD ""
-      if ghPat == "" then
-        return errorResponse "500 Internal Server Error" "GITHUB_PAT not set"
-      let child ← IO.Process.spawn {
-        cmd := "gh"
-        args := #["pr", "create",
-          "--repo", state.upstream,
-          "--head", s!"{(state.fork.splitOn "/")[0]!}:{head}",
-          "--base", base,
-          "--title", title,
-          "--body", prBody]
-        env := #[("GH_TOKEN", some ghPat)]
-        stdout := .piped
-        stderr := .piped
-      }
-      let stdout ← child.stdout.readToEnd
-      let stderr ← child.stderr.readToEnd
-      let code ← child.wait
-      if code != 0 then
-        return errorResponse "500 Internal Server Error" s!"gh pr create failed: {stderr.trimAscii.toString}"
-      return okResponse (.str stdout.trimAscii.toString)
-  | _, _ =>
-    return errorResponse "404 Not Found" s!"unknown endpoint: {method} {path}"
+      log "tool create_pr: denied (fork-only mode)"
+      return toolContent "PR creation not allowed in fork-only mode" (isError := true)
+    let title := args.getObjValAs? String "title" |>.toOption |>.getD "Agent PR"
+    let body := args.getObjValAs? String "body" |>.toOption |>.getD ""
+    let head := args.getObjValAs? String "head" |>.toOption |>.getD ""
+    let base := args.getObjValAs? String "base" |>.toOption |>.getD "main"
+    if head.isEmpty then
+      log "tool create_pr: error: missing 'head'"
+      return toolContent "missing 'head' (branch name)" (isError := true)
+    if state.pat.isEmpty then
+      log "tool create_pr: error: PAT not configured"
+      return toolContent "github.pat not set in config" (isError := true)
+    log s!"tool create_pr: {state.fork}:{head} -> {state.upstream} base={base} title={repr title}"
+    let forkOwner := (state.fork.splitOn "/")[0]!
+    try
+      let result ← GitHub.createPullRequest state.pat state.upstream
+        s!"{forkOwner}:{head}" base title body
+      log s!"tool create_pr: ok: {result.trimAscii}"
+      return toolContent result
+    catch e =>
+      log s!"tool create_pr: error: {e}"
+      return toolContent (toString e) (isError := true)
+  | _ =>
+    log s!"tool {name}: unknown"
+    return toolContent s!"unknown tool: {name}" (isError := true)
 
-/-- Await the result of a TCP IO.Promise. -/
+/-- Dispatch a JSON-RPC message. Returns Some response, or None for notifications. -/
+private def handleMessage (state : State) (msg : Json) : IO (Option Json) := do
+  let id := msg.getObjVal? "id" |>.toOption |>.getD .null
+  let some method := msg.getObjValAs? String "method" |>.toOption | return none
+  let params := msg.getObjVal? "params" |>.toOption |>.getD (Json.mkObj [])
+  match method with
+  | "initialize" =>
+    log "initialize"
+    return some (jsonrpcResult id initializeResult)
+  | "notifications/initialized" =>
+    log "initialized"
+    return none
+  | "tools/list" =>
+    log "tools/list"
+    return some (jsonrpcResult id toolsList)
+  | "tools/call" =>
+    let toolName := params.getObjValAs? String "name" |>.toOption |>.getD ""
+    let toolArgs := params.getObjVal? "arguments" |>.toOption |>.getD (Json.mkObj [])
+    let result ← callTool state toolName toolArgs
+    return some (jsonrpcResult id result)
+  | _ =>
+    log s!"unknown method: {method}"
+    return some (jsonrpcError id (-32601) s!"method not found: {method}")
+
+-- TCP transport (raw JSON-RPC, newline-delimited)
+
 private def awaitTcp (p : IO.Promise (Except IO.Error α)) : IO α := do
   let result ← IO.wait p.result!
   match result with
   | .error e => throw e
   | .ok v => return v
 
-/-- Handle a single client connection. -/
+/--
+Handle one TCP client connection as a JSON-RPC session.
+Reads newline-delimited JSON messages, dispatches them, and writes responses.
+A line buffer handles the case where a single TCP receive spans multiple messages
+or a message is split across multiple receives.
+-/
 private def handleClient (state : State) (client : Socket) : IO Unit := do
-  -- Read the request (up to 64KB)
-  let data? ← awaitTcp (← client.recv? 65536)
-  match data? with
-  | none => return  -- EOF
-  | some data =>
-    let raw := String.fromUTF8! data
-    match parseHttpRequest raw with
-    | none =>
-      let resp := errorResponse "400 Bad Request" "malformed HTTP request"
-      let _ ← awaitTcp (← client.send #[resp.toUTF8])
-    | some (method, path, body) =>
-      let resp ← handleRequest state method path body
-      let _ ← awaitTcp (← client.send #[resp.toUTF8])
-    let _ ← awaitTcp (← client.shutdown)
+  let buf ← IO.mkRef ""
+  repeat do
+    let data? ← awaitTcp (← client.recv? 65536)
+    match data? with
+    | none => return
+    | some bytes =>
+      buf.modify (· ++ String.fromUTF8! bytes)
+      let lines := (← buf.get).splitOn "\n"
+      -- All elements except the last are complete lines; the last may be partial.
+      buf.set (lines.getLast?.getD "")
+      for line in lines.dropLast do
+        let trimmed := line.trimAscii.toString
+        if trimmed.isEmpty then continue
+        match Json.parse trimmed with
+        | .error _ => pure ()
+        | .ok msg =>
+          match ← handleMessage state msg with
+          | none => pure ()
+          | some response =>
+            let _ ← awaitTcp (← client.send #[(response.compress ++ "\n").toUTF8])
 
-/-- Start the HTTP server. Returns (port, shutdown action). -/
+/-- Start the MCP server. Returns (port, shutdown action). -/
 def start (state : State) : IO (UInt16 × IO Unit) := do
   let server ← Socket.new
-  -- Bind to localhost on port 0 (OS picks a free port)
   let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := 0 }
   server.bind addr
   server.listen 8
-  -- Get the actual port
   let localAddr ← server.getSockName
   let port := match localAddr with
-    | .v4 a => a.port
-    | .v6 a => a.port
+    | .v4 a => a.port | .v6 a => a.port
   let running ← IO.mkRef true
-  -- Accept loop in background
   let _acceptTask ← IO.asTask (prio := .dedicated) do
     while ← running.get do
       match ← IO.wait (← server.accept).result! with
       | .error _ => break
       | .ok client =>
-        if !(← running.get) then break  -- shutdown wakeup, discard
+        if !(← running.get) then break
         let _ ← IO.asTask (prio := .dedicated) do
-          try
-            handleClient state client
-          catch _ =>
-            pure ()
+          log "client connected"
+          try handleClient state client
+          catch _ => pure ()
+          log "client disconnected"
   let shutdown : IO Unit := do
     running.set false
-    -- Make a dummy connection to unblock the accept loop.
-    -- (cancelAccept drops the promise, causing result! to panic)
     try
       let dummy ← Socket.new
-      let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := port }
+      let addr := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port }
       let _ ← dummy.connect addr
     catch _ => pure ()
   return (port, shutdown)

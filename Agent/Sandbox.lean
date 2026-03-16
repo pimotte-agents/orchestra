@@ -1,4 +1,7 @@
 import Agent.StreamFormat
+import Lean.Data.Json
+
+open Lean (Json)
 
 namespace Agent.Sandbox
 
@@ -39,7 +42,8 @@ private def homeRwPaths : IO (List System.FilePath) := do
 
 /--
 Launch the coding agent inside a landrun sandbox.
-Returns the exit code of the agent process.
+The MCP server (running in the parent process) is exposed to the agent via an MCP config
+file written to /tmp. Returns the exit code of the agent process.
 -/
 private def shellEscape (s : String) : String :=
   if s.any (fun c => c == ' ' || c == '"' || c == '\'' || c == '\\' || c == '$' || c == '`'
@@ -53,6 +57,17 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
     (ghToken : String)
     (debug : Bool := false)
     (extraEnv : Array (String × Option String) := #[]) : IO UInt32 := do
+  -- Write MCP config: nc bridges claude's stdio to the JSON-RPC TCP server in the parent process.
+  -- The parent process holds all secrets; the sandbox only gets a TCP connection to it.
+  let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
+    ("agent", Json.mkObj [
+      ("command", .str "nc"),
+      ("args", .arr #[.str "127.0.0.1", .str (toString serverPort)])
+    ])
+  ])]
+  let ts ← IO.monoNanosNow
+  let mcpConfigPath := System.FilePath.mk s!"/tmp/agent-mcp-{ts}.json"
+  IO.FS.writeFile mcpConfigPath mcpConfig.compress
   let mut args : Array String := #[]
   -- Read-write access to the repo and /tmp
   args := args.push "--rwx" |>.push repoPath.toString
@@ -77,13 +92,11 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   for p in ← homeRwPaths do
     if ← p.pathExists then
       args := args.push "--rw" |>.push p.toString
-  -- Network: allow connecting to local server and external HTTPS
+  -- Network: allow connecting to the local MCP server and external HTTPS
   args := args.push "--connect-tcp" |>.push (toString serverPort)
   args := args.push "--connect-tcp" |>.push "443"
   -- Environment variables for the sandboxed command
   args := args.push "--env" |>.push s!"GH_TOKEN={ghToken}"
-  args := args.push "--env" |>.push s!"AGENT_SERVER_PORT={serverPort}"
-  args := args.push "--env" |>.push s!"AGENT_SERVER_URL=http://127.0.0.1:{serverPort}"
   -- Pass through inherited env vars by name
   for name in ["SHELL", "PATH", "HOME", "USER", "TERM"] do
     args := args.push "--env" |>.push name
@@ -99,6 +112,8 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   args := args.push "--output-format=stream-json"
   args := args.push "--verbose"
   args := args.push "--dangerously-skip-permissions"
+  args := args.push "--mcp-config"
+  args := args.push mcpConfigPath.toString
   args := args.push "-p"
   args := args.push prompt
   if debug then
@@ -134,6 +149,9 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   -- Wait for streams to drain (EOF when child exits), then collect exit code
   let _ ← IO.wait outTask
   let _ ← IO.wait errTask
-  child.wait
+  let exitCode ← child.wait
+  -- Clean up MCP config
+  try IO.FS.removeFile mcpConfigPath catch _ => pure ()
+  return exitCode
 
 end Agent.Sandbox
