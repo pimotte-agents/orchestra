@@ -57,7 +57,8 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
     (ghToken : String)
     (debug : Bool := false)
     (extraEnv : Array (String × Option String) := #[])
-    (pluginDirs : Array String := #[]) : IO UInt32 := do
+    (pluginDirs : Array String := #[])
+    (subAgent : Option String := none) : IO UInt32 := do
   -- Write MCP config: nc bridges claude's stdio to the JSON-RPC TCP server in the parent process.
   -- The parent process holds all secrets; the sandbox only gets a TCP connection to it.
   let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
@@ -120,8 +121,11 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   args := args.push "--mcp-config"
   args := args.push mcpConfigPath.toString
   for p in pluginDirs do
-    args := args.push "--add-dir"
+    args := args.push "--plugin-dir"
     args := args.push p
+  if let some name := subAgent then
+    args := args.push "--agent"
+    args := args.push name
   args := args.push "-p"
   args := args.push prompt
   if debug then

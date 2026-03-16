@@ -25,6 +25,7 @@ structure Task where
   fork : String
   mode : TaskMode
   prompt : String
+  agent : Option String := none
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -33,7 +34,8 @@ instance : FromJson Task where
     let fork ← j.getObjValAs? String "fork"
     let mode ← j.getObjValAs? TaskMode "mode"
     let prompt ← j.getObjValAs? String "prompt"
-    return { upstream, fork, mode, prompt }
+    let agent := j.getObjValAs? String "agent" |>.toOption
+    return { upstream, fork, mode, prompt, agent }
 
 structure AppConfig where
   appId : Nat
