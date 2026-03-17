@@ -1,62 +1,78 @@
-# Implementation Plan: Task Persistence and Session Continuity
+# Implementation Plan: Task Queue Mode
 
 ## Overview
 
-Add a persistent task store so every agent run is recorded with a unique ID and its
-Claude session ID. This enables:
-- Continuing a previous session by ID (`--continues`)
-- Grouping related runs into a named series
-- Resuming the latest run in a series with a new prompt (`agent resume`)
-- Querying task history (`agent tasks`, `agent task <id>`, `agent series`)
+Extend the agent CLI with a **queue mode**: a long-running daemon process that
+executes tasks one at a time as they are submitted, plus a subcommand to add
+tasks to the queue.
 
-The queue-mode extension described in DESIGN.md is out of scope for this plan.
+This builds on the existing `TaskStore`, `Task`, `AppConfig`, and series
+mechanisms without changing them.
+
+---
+
+## New Subcommands
+
+```
+agent queue-start [--config <path>] [--debug]
+    Start the queue daemon. Polls ~/.agent/queue/ for pending entries and
+    runs them serially. Writes a PID file and exits if a daemon is already running.
+
+agent enqueue <task-file> [--task N] [--series <name>] [--continues <id>] [--config <path>]
+    Add one or more tasks from a task file to the queue.
+    Prints the queue entry ID(s) on stdout.
+
+agent queue [--limit N]
+    List recent queue entries (pending, running, done, failed), most recent first.
+```
 
 ---
 
 ## Data Model
 
-### Task Record
+### Queue Entry
 
-Every call to `runTask` creates one record stored at
-`~/.agent/tasks/<id>.json`:
+One file per queued task at `~/.agent/queue/<entry-id>.json`:
 
 ```json
 {
-  "id":             "0123456789abcdef",
-  "created_at":     "2024-01-15T14:30:00Z",
-  "upstream":       "leanprover-community/mathlib4",
-  "fork":           "mybot/mathlib4",
-  "mode":           "pr",
-  "prompt":         "Fix the sorry in Algebra.Group.Defs",
-  "session_id":     "abc123...",
-  "status":         "completed",
-  "continues_from": "fedcba9876543210",
-  "series":         "mathlib-fixes"
+  "id":            "0123456789abcdef",
+  "created_at":    "2026-01-15T14:30:00Z",
+  "status":        "pending",
+  "upstream":      "leanprover-community/mathlib4",
+  "fork":          "mybot/mathlib4",
+  "mode":          "pr",
+  "prompt":        "Fix the sorry in Algebra.Group.Defs",
+  "agent":         null,
+  "system_prompt": null,
+  "backend":       null,
+  "model":         null,
+  "continues_from": null,
+  "series":        "mathlib-fixes",
+  "task_id":       null,
+  "config_path":   null
 }
 ```
 
-`continues_from` and `series` are omitted when not applicable.
-`session_id` is omitted until the agent emits its `init` event and is updated
-after the run completes.
-`status` is one of `"running"`, `"completed"`, `"failed"`.
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | String | 16-char hex, same format as `TaskStore.generateId` |
+| `created_at` | String | ISO 8601 UTC |
+| `status` | String | `"pending"` \| `"running"` \| `"done"` \| `"failed"` |
+| `upstream`, `fork`, `mode`, `prompt` | String | Task fields (required) |
+| `agent`, `system_prompt`, `backend`, `model` | String? | Optional task fields |
+| `continues_from` | String? | TaskStore task ID to continue |
+| `series` | String? | Series name to assign on completion |
+| `task_id` | String? | TaskStore ID written when the daemon picks up the entry |
+| `config_path` | String? | Path to app config (overrides default) |
 
-### Series Pointer
+Status transitions: `pending → running → done | failed`
 
-`~/.agent/series/<name>.json` holds a single pointer to the latest task in
-the series:
+### PID File
 
-```json
-{ "latest_task_id": "0123456789abcdef" }
-```
-
-Updated atomically (write temp file, rename) after each run that belongs to
-the series.
-
-### Task ID Format
-
-A 16-character lowercase hex string derived from `IO.monoNanosNow` (a
-monotonically increasing `UInt64` nanosecond counter). Lexicographically
-sortable, globally unique within a single machine.
+`~/.agent/queue/daemon.pid` — contains the daemon's OS PID as a decimal string.
+Written at startup; deleted on clean exit. Used to prevent duplicate daemons and
+to report daemon status in `agent queue`.
 
 ---
 
@@ -64,185 +80,130 @@ sortable, globally unique within a single machine.
 
 ```
 ~/.agent/
-  tasks/
-    0123456789abcdef.json   ← one file per task run
-    ...
-  series/
-    mathlib-fixes.json      ← series pointer files
+  queue/
+    daemon.pid              ← written by queue-start, deleted on exit
+    0123456789abcdef.json   ← one file per enqueued task
     ...
 ```
 
 ---
 
-## New Module: `Agent/TaskStore.lean`
+## New Module: `Agent/Queue.lean`
 
 ### Types
 
 ```lean
-inductive TaskStatus where
-  | running | completed | failed
+inductive QueueStatus where
+  | pending | running | done | failed
+deriving Repr
 
-structure TaskRecord where
+instance : FromJson QueueStatus   -- "pending" | "running" | "done" | "failed"
+instance : ToJson QueueStatus
+
+structure QueueEntry where
   id           : String
-  createdAt    : String         -- ISO 8601, from `date -u +%Y-%m-%dT%H:%M:%SZ`
+  createdAt    : String
+  status       : QueueStatus    := .pending
   upstream     : String
   fork         : String
   mode         : TaskMode
   prompt       : String
-  sessionId    : Option String  := none
-  status       : TaskStatus     := .running
+  agent        : Option String  := none
+  systemPrompt : Option String  := none
+  backend      : Option String  := none
+  model        : Option String  := none
   continuesFrom : Option String := none
   series       : Option String  := none
+  taskId       : Option String  := none
+  configPath   : Option String  := none
+
+instance : FromJson QueueEntry
+instance : ToJson QueueEntry
 ```
 
 ### Functions
 
 | Function | Signature | Purpose |
 |----------|-----------|---------|
-| `tasksDir` | `IO System.FilePath` | `~/.agent/tasks/` |
-| `seriesDir` | `IO System.FilePath` | `~/.agent/series/` |
-| `generateId` | `IO String` | 16-char hex from `IO.monoNanosNow` |
-| `saveTask` | `TaskRecord → IO Unit` | Write `tasks/<id>.json` |
-| `loadTask` | `String → IO (Option TaskRecord)` | Load by ID; `none` if missing |
-| `loadAllTasks` | `IO (Array TaskRecord)` | Load all records, sorted by ID descending |
-| `latestInSeries` | `String → IO (Option String)` | Read series pointer → task ID |
-| `updateSeriesPointer` | `String → String → IO Unit` | Write series pointer atomically |
+| `queueDir` | `IO System.FilePath` | `~/.agent/queue/` |
+| `pidFile` | `IO System.FilePath` | `~/.agent/queue/daemon.pid` |
+| `saveEntry` | `QueueEntry → IO Unit` | Write `<id>.json` atomically |
+| `loadEntry` | `String → IO (Option QueueEntry)` | Load by ID |
+| `loadAllEntries` | `IO (Array QueueEntry)` | All entries, sorted by ID descending |
+| `nextPending` | `IO (Option QueueEntry)` | Oldest `pending` entry, or `none` |
+| `writePid` | `UInt32 → IO Unit` | Write daemon PID |
+| `readPid` | `IO (Option UInt32)` | Read daemon PID; `none` if missing |
+| `deletePid` | `IO Unit` | Remove PID file |
+| `daemonRunning` | `IO Bool` | Check if process with stored PID is alive (`/proc/<pid>`) |
 
-`saveTask` and `updateSeriesPointer` write atomically: write to `<path>.tmp`,
-then rename.
-
-`ToJson`/`FromJson` instances are derived for `TaskStatus` and `TaskRecord`.
-
----
-
-## Modified: `Agent/Sandbox.lean`
-
-No changes needed — `resume : Option String` and the `(UInt32 × Option String)`
-return type were already added in the previous feature.
-
----
-
-## Modified: `Agent/Basic.lean` / `Agent.lean`
-
-Add `import Agent.TaskStore` to `Agent.lean`.
+`saveEntry` writes atomically (temp file + rename), same pattern as `TaskStore`.
 
 ---
 
 ## Modified: `Main.lean`
 
-### `runTask` signature extension
-
-```lean
-private def runTask
-    (appConfig    : AppConfig)
-    (task         : Task)
-    (idx          : Nat)
-    (debug        : Bool)
-    (continuesFrom : Option String := none)
-    (series        : Option String := none) : IO Unit
-```
-
-### `runTask` body changes
-
-**Before the validation loop**, insert:
-
-1. Generate a task ID: `let taskId ← TaskStore.generateId`
-2. Resolve initial resume ID: if `continuesFrom` is `some prevId`, load
-   `TaskStore.loadTask prevId` and extract `sessionId` → `initialResume`.
-   If the referenced task doesn't exist or has no session ID, warn and
-   set `initialResume := none`.
-3. Create and save the initial task record (status `running`).
-
-**In the validation loop**, change the resume logic so that the first attempt
-uses `initialResume` (from `continuesFrom`) rather than `none`:
-
-```lean
-let resume := if attempt == 0 then initialResume else sessionId
-```
-
-**After the validation loop**, update the record with the final session ID
-and status (`completed` or `failed` — treat exhausted retries as
-`completed` since the agent did run).
-
-**After `after.sh`**, if `series` is `some name`:
-- `TaskStore.updateSeriesPointer name taskId`
-
-### `runHandler` changes
-
-Read two new flags from `Parsed`:
-- `--continues <id>` (optional `String`)
-- `--series <name>` (optional `String`)
-
-When `--continues` is set and `--task` is not set and the task file has more
-than one task, emit an error: `--continues requires --task when the file has
-multiple tasks`.
-
-Pass `continuesFrom` and `series` through to each `runTask` call.
-
-### New subcommand handlers
-
-#### `tasksHandler`
+### New handler: `queueStartHandler`
 
 ```
-agent tasks [--limit N]
+agent queue-start [--config <path>] [--debug]
 ```
 
-Load all task records via `TaskStore.loadAllTasks`.
-Print a table (most recent first):
+1. Check `Queue.daemonRunning`. If true, print error and return 1.
+2. Write own PID via `Queue.writePid`.
+3. Load `AppConfig` from `--config` (or default).
+4. Enter polling loop:
+   - `Queue.nextPending` → if `none`, sleep 2 seconds and repeat.
+   - Mark entry `running` (`Queue.saveEntry { e with status := .running }`).
+   - Construct `Task` from entry fields.
+   - Call `runTask appConfig task 0 debug (continuesFrom := e.continuesFrom) (series := e.series)`.
+     - `runTask` already handles TaskStore recording, series pointer update, GitHub auth, cloning, MCP server, and validation loop.
+   - On success: `Queue.saveEntry { e with status := .done, taskId := some taskId }`.
+     - To get `taskId`, `runTask` must return the ID it created. See **`runTask` return value** below.
+   - On exception: `Queue.saveEntry { e with status := .failed }`, log error, continue loop.
+5. On SIGTERM / clean exit: `Queue.deletePid`.
+
+### `runTask` return value change
+
+`runTask` currently returns `IO Unit`. Change it to `IO String` (returns the
+task ID it created). This lets `queueStartHandler` link the queue entry to the
+TaskStore record.
+
+The change is purely additive — existing callers that ignore the return value
+need only add `let _ ←` or `discard`.
+
+### New handler: `enqueueHandler`
 
 ```
-ID               CREATED              FORK                        STATUS     SERIES
-0123456789abcdef 2024-01-15T14:30:00Z mybot/mathlib4              completed  mathlib-fixes
+agent enqueue <task-file> [--task N] [--series <name>] [--continues <id>] [--config <path>]
 ```
 
-`--limit N` (default 20) caps the number of rows.
+1. Load task file.
+2. Select tasks (all, or just index `--task N`).
+3. Validate `--continues` requires `--task` with multi-task files (same rule as `run`).
+4. For each selected task, build a `QueueEntry`:
+   - `id ← TaskStore.generateId` (reuse existing ID generator)
+   - `createdAt ← TaskStore.currentIso8601`
+   - Copy `upstream`, `fork`, `mode`, `prompt`, `agent`, `systemPrompt`, `backend`, `model` from task
+   - `continuesFrom` and `series` from flags
+   - `configPath` from `--config` flag
+   - `status := .pending`
+5. `Queue.saveEntry entry` for each.
+6. Print each entry ID on stdout.
 
-#### `taskShowHandler`
-
-```
-agent task <id>
-```
-
-Load the record by ID. Print all fields. If not found, error.
-
-#### `seriesHandler`
-
-```
-agent series
-```
-
-List all series files in `~/.agent/series/`, printing each series name and its
-latest task ID and status.
-
-#### `resumeHandler`
+### New handler: `queueListHandler`
 
 ```
-agent resume <series-name> --prompt "..."
+agent queue [--limit N]
 ```
 
-1. `TaskStore.latestInSeries seriesName` → `prevId`
-2. `TaskStore.loadTask prevId` → `prevRecord`
-3. Construct a `Task` inheriting `fork`, `upstream`, `mode` from `prevRecord`,
-   with `prompt` from the flag, and `agent`/`systemPrompt` defaults.
-4. Load `AppConfig` (with optional `--config` flag).
-5. Call `runTask appConfig task 0 debug (continuesFrom := prevId) (series := seriesName)`.
-
----
-
-## New CLI Commands
+1. `Queue.loadAllEntries` (most recent first, capped at `--limit` default 20).
+2. If `Queue.daemonRunning`, print `Daemon running (PID <n>)`. Otherwise `Daemon not running.`
+3. Print table:
 
 ```
-agent tasks [--limit N]          List recent task runs
-agent task <id>                  Show details of one task run
-agent series                     List all task series
-agent resume <series> -p <text>  Resume latest task in a series
-```
-
-### `run` command flag additions
-
-```
---continues <id>   Resume the Claude session of a previous task
---series <name>    Add this run to a named task series
+ID               CREATED              FORK                        STATUS   SERIES
+0123456789abcdef 2026-01-15T14:30:00Z mybot/mathlib4              pending  mathlib-fixes
+fedcba9876543210 2026-01-15T14:28:00Z mybot/std4                  done     -
 ```
 
 ---
@@ -258,15 +219,40 @@ SUBCOMMANDS:
   tasksCmd;
   taskCmd;
   seriesCmd;
-  resumeCmd
+  tagCmd;
+  resumeCmd;
+  queueStartCmd;
+  enqueueCmd;
+  queueListCmd
 ```
+
+---
+
+## Integration with Existing Mechanisms
+
+- **TaskStore**: `queueStartHandler` calls `runTask` which already handles all
+  TaskStore operations. No changes needed to `TaskStore.lean`.
+- **Series**: `runTask` already calls `TaskStore.updateSeriesPointer` when
+  `series` is set. `enqueueHandler` stores the series name in the queue entry;
+  `queueStartHandler` passes it to `runTask`.
+- **`--continues`**: `runTask` already resolves `continuesFrom` to a session ID.
+  `queueStartHandler` passes `continuesFrom` from the queue entry.
+- **`AppConfig`**: `queueStartHandler` loads config once at startup (not per
+  task), since the daemon is a single-user process. `enqueueHandler` stores
+  `configPath` in the entry for the daemon to use if different from its own
+  default.
 
 ---
 
 ## Implementation Order
 
-1. `Agent/TaskStore.lean` — types, JSON instances, storage functions
-2. `Agent.lean` — add import
-3. `Main.lean` — extend `runTask` + `runHandler`
-4. `Main.lean` — add `tasksCmd`, `taskCmd`, `seriesCmd`, `resumeCmd` handlers and commands
-5. Build and verify
+1. **`Agent/Queue.lean`** — `QueueStatus`, `QueueEntry`, JSON instances,
+   `queueDir`, `pidFile`, `saveEntry`, `loadEntry`, `loadAllEntries`,
+   `nextPending`, `writePid`, `readPid`, `deletePid`, `daemonRunning`
+2. **`Agent.lean`** — add `import Agent.Queue`
+3. **`Main.lean`** — change `runTask` to return `IO String`; update existing callers
+4. **`Main.lean`** — add `enqueueHandler` and `enqueueCmd`
+5. **`Main.lean`** — add `queueStartHandler` and `queueStartCmd`
+6. **`Main.lean`** — add `queueListHandler` and `queueListCmd`
+7. **`Main.lean`** — register new commands in `agentCmd`
+8. Build and verify

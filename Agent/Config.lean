@@ -27,6 +27,10 @@ structure Task where
   prompt : String
   agent : Option String := none
   systemPrompt : Option String := none
+  /-- Agent backend to use: "claude" (default) or "vibe". -/
+  backend : Option String := none
+  /-- Model override passed to the agent (e.g. "sonnet", "devstral-small"). -/
+  model : Option String := none
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -37,7 +41,9 @@ instance : FromJson Task where
     let prompt ← j.getObjValAs? String "prompt"
     let agent := j.getObjValAs? String "agent" |>.toOption
     let systemPrompt := j.getObjValAs? String "system_prompt" |>.toOption
-    return { upstream, fork, mode, prompt, agent, systemPrompt }
+    let backend := j.getObjValAs? String "backend" |>.toOption
+    let model := j.getObjValAs? String "model" |>.toOption
+    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model }
 
 structure AppConfig where
   appId : Nat

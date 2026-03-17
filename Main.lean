@@ -40,11 +40,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
         IO.eprintln s!"  Warning: task '{prevId}' not found, ignoring --continues"
         pure none
       | some prev => pure prev.sessionId
-  -- 1. Clone / update repo
-  IO.println s!"Cloning/updating {task.fork}..."
-  let repoPath ← Repo.ensureCloned task.fork task.upstream
-  IO.println s!"  Repo at {repoPath}"
-  -- 2. Create GitHub App token
+  -- 1. Create GitHub App token
   IO.println "  Creating GitHub App token..."
   let jwt ← GitHub.createJWT appConfig.appId appConfig.privateKeyPath
   let (forkOwner, _) ← Repo.splitRepo task.fork
@@ -54,6 +50,10 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   let token ← GitHub.createInstallationToken jwt installationId
   GitHub.setupGhAuth token
   IO.println "  Token ready"
+  -- 2. Clone / update repo
+  IO.println s!"Cloning/updating {task.fork}..."
+  let repoPath ← Repo.ensureCloned task.fork task.upstream
+  IO.println s!"  Repo at {repoPath}"
   -- 3. Start MCP server (runs in this process, outside the sandbox)
   let serverState : Server.State := {
     upstream := task.upstream
@@ -78,9 +78,12 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let prompt := if attempt == 0 then task.prompt else repoConfig.validation.retryPrompt
     let resume := if attempt == 0 then initialResume else sessionId
     IO.println s!"  Launching agent (attempt {attempt + 1}/{maxAttempts})..."
-    let (exitCode, sid) ← Sandbox.launchAgent repoPath prompt port token
+    let agentDef := match task.backend with
+      | some "vibe" => AgentDef.vibe
+      | _           => AgentDef.claude
+    let (exitCode, sid) ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
-      (systemPrompt := systemPrompt) (resume := resume)
+      (model := task.model) (systemPrompt := systemPrompt) (resume := resume)
     IO.println s!"  Agent exited with code {exitCode}"
     sessionId := sid
     let valid ← RepoConfig.runValidation repoPath
@@ -223,6 +226,16 @@ private def seriesHandler (_ : Parsed) : IO UInt32 := do
     IO.println s!"{padRight name 24} {latestId}"
   return (0 : UInt32)
 
+private def tagHandler (p : Parsed) : IO UInt32 := do
+  let id         := p.positionalArg! "id"     |>.as! String
+  let seriesName := p.positionalArg! "series" |>.as! String
+  let some r ← TaskStore.loadTask id
+    | IO.eprintln s!"Task '{id}' not found"; return 1
+  TaskStore.saveTask { r with series := some seriesName }
+  TaskStore.updateSeriesPointer seriesName id
+  IO.println s!"Task {id} added to series '{seriesName}'"
+  return (0 : UInt32)
+
 private def resumeHandler (p : Parsed) : IO UInt32 := do
   let seriesName := p.positionalArg! "series" |>.as! String
   let prompt     := p.flag? "prompt" |>.map (·.as! String) |>.getD ""
@@ -309,6 +322,15 @@ private def seriesCmd : Cmd := `[Cli|
   "List all task series."
 ]
 
+private def tagCmd : Cmd := `[Cli|
+  tag VIA tagHandler; ["0.1.0"]
+  "Add a completed task to a series, making it the latest entry."
+
+  ARGS:
+    "id" : String; "Task ID to tag"
+    "series" : String; "Series name"
+]
+
 private def resumeCmd : Cmd := `[Cli|
   resume VIA resumeHandler; ["0.1.0"]
   "Resume the latest run in a series with a new prompt."
@@ -338,6 +360,7 @@ def agentCmd : Cmd := `[Cli|
     tasksCmd;
     taskCmd;
     seriesCmd;
+    tagCmd;
     resumeCmd
 ]
 

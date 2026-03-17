@@ -1,3 +1,4 @@
+import Agent.AgentDef
 import Agent.Config
 import Agent.GitHub
 import Agent.Repo

@@ -1,49 +1,20 @@
+import Agent.AgentDef
 import Agent.StreamFormat
-import Lean.Data.Json
-
-open Lean (Json)
 
 namespace Agent.Sandbox
 
-/-- System paths that need read+execute (contain binaries/libraries). -/
-private def roxPaths : List String :=
-  [ "/usr", "/lib", "/lib64", "/bin", "/sbin", "/nix" ]
-
-/-- System paths that need read-only access (config, etc). -/
-private def roPaths : List String :=
-  [ "/etc", "/run", "/dev", "/proc", "/sys" ]
-
-/-- System paths that need read-write access. -/
-private def rwPaths : List String :=
-  [ "/dev/null" ]
-
-/-- Get additional read-only-execute paths (home-relative). -/
-private def homeRoxPaths : IO (List System.FilePath) := do
+/-- Expand home-relative path strings to absolute FilePaths using $HOME. -/
+private def expandHomePaths (rel : List String) : IO (List System.FilePath) := do
   match ← IO.getEnv "HOME" with
+  | none   => return []
   | some h =>
     let home := System.FilePath.mk h
-    return [ home / ".elan"
-           , home / ".cache"
-           , home / ".local" ]
-  | none => return []
-
-/-- Home paths that need read-write access. -/
-private def homeRwPaths : IO (List System.FilePath) := do
-  match ← IO.getEnv "HOME" with
-  | some h =>
-    let home := System.FilePath.mk h
-    return [ home / ".claude"
-           , home / ".claude.json"
-           , home / ".gitconfig"
-           , home / ".config" / "claude"
-           , home / ".config" / "gh"
-           , home / ".config" / "git" ]
-  | none => return []
+    return rel.map (fun r => home / System.FilePath.mk r)
 
 /--
 Launch the coding agent inside a landrun sandbox.
-The MCP server (running in the parent process) is exposed to the agent via an MCP config
-file written to /tmp. Returns the exit code of the agent process.
+The agent backend's setupMcp hook runs before launch to configure MCP connectivity.
+Returns the exit code and the session ID captured from the agent's output (if any).
 -/
 private def shellEscape (s : String) : String :=
   if s.any (fun c => c == ' ' || c == '"' || c == '\'' || c == '\\' || c == '$' || c == '`'
@@ -52,48 +23,41 @@ private def shellEscape (s : String) : String :=
     "'" ++ s.replace "'" "'\\''" ++ "'"
   else s
 
-def launchAgent (repoPath : System.FilePath) (prompt : String)
+def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : String)
     (serverPort : UInt16)
     (ghToken : String)
     (debug : Bool := false)
     (extraEnv : Array (String × Option String) := #[])
     (pluginDirs : Array String := #[])
     (subAgent : Option String := none)
+    (model : Option String := none)
     (systemPrompt : Option String := none)
     (resume : Option String := none) : IO (UInt32 × Option String) := do
-  -- Write MCP config: nc bridges claude's stdio to the JSON-RPC TCP server in the parent process.
-  -- The parent process holds all secrets; the sandbox only gets a TCP connection to it.
-  let mcpConfig := Json.mkObj [("mcpServers", Json.mkObj [
-    ("agent", Json.mkObj [
-      ("command", .str "nc"),
-      ("args", .arr #[.str "127.0.0.1", .str (toString serverPort)])
-    ])
-  ])]
-  let ts ← IO.monoNanosNow
-  let mcpConfigPath := System.FilePath.mk s!"/tmp/agent-mcp-{ts}.json"
-  IO.FS.writeFile mcpConfigPath mcpConfig.compress
+  -- Run agent-specific MCP setup (writes config files, returns extra env vars)
+  let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
+  let paths := agentDef.sandboxPaths
   let mut args : Array String := #[]
   -- Read-write access to the repo and /tmp
   args := args.push "--rwx" |>.push repoPath.toString
   args := args.push "--rw" |>.push "/tmp"
   -- Read+execute system paths (binaries, libraries)
-  for p in roxPaths do
+  for p in paths.rox do
     if ← System.FilePath.pathExists p then
       args := args.push "--rox" |>.push p
   -- Read-only system paths
-  for p in roPaths do
+  for p in paths.ro do
     if ← System.FilePath.pathExists p then
       args := args.push "--ro" |>.push p
   -- Read-write system paths (e.g. /dev/null)
-  for p in rwPaths do
+  for p in paths.rw do
     if ← System.FilePath.pathExists p then
       args := args.push "--rw" |>.push p
-  -- Home paths with execute
-  for p in ← homeRoxPaths do
+  -- Home-relative paths with execute
+  for p in ← expandHomePaths paths.homeRox do
     if ← p.pathExists then
       args := args.push "--rox" |>.push p.toString
-  -- Home paths read-write (claude config/state)
-  for p in ← homeRwPaths do
+  -- Home-relative paths read-write (agent config/state)
+  for p in ← expandHomePaths paths.homeRw do
     if ← p.pathExists then
       args := args.push "--rw" |>.push p.toString
   -- Plugin directories (read+execute access)
@@ -108,34 +72,21 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   -- Pass through inherited env vars by name
   for name in ["SHELL", "PATH", "HOME", "USER", "TERM"] do
     args := args.push "--env" |>.push name
-  -- Extra env vars
+  -- Agent-specific env vars (e.g. VIBE_HOME, MISTRAL_API_KEY)
+  for (k, v) in agentEnv do
+    match v with
+    | some val => args := args.push "--env" |>.push s!"{k}={val}"
+    | none => pure ()
+  -- Caller-supplied extra env vars
   for (k, v) in extraEnv do
     match v with
     | some val => args := args.push "--env" |>.push s!"{k}={val}"
     | none => pure ()
-  -- Separator and the actual command
+  -- Separator and the actual command with its args
   args := args.push "--"
-  args := args.push "claude"
-  args := args.push "--print"
-  args := args.push "--output-format=stream-json"
-  args := args.push "--verbose"
-  args := args.push "--dangerously-skip-permissions"
-  args := args.push "--mcp-config"
-  args := args.push mcpConfigPath.toString
-  for p in pluginDirs do
-    args := args.push "--plugin-dir"
-    args := args.push p
-  if let some name := subAgent then
-    args := args.push "--agent"
-    args := args.push name
-  if let some content := systemPrompt then
-    args := args.push "--append-system-prompt"
-    args := args.push content
-  if let some sid := resume then
-    args := args.push "--resume"
-    args := args.push sid
-  args := args.push "-p"
-  args := args.push prompt
+  args := args.push agentDef.command
+  let agentArgs := agentDef.buildArgs mcpContext pluginDirs subAgent model systemPrompt resume prompt
+  args := args ++ agentArgs
   if debug then
     let argsStr := String.intercalate " " (args.toList.map shellEscape)
     IO.eprintln s!"[debug] cd {shellEscape repoPath.toString} && landrun {argsStr}"
@@ -147,14 +98,14 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
     stdout := .piped
     stderr := .piped
   }
-  -- Stream stdout, parse stream-json events and format for display
+  -- Stream stdout, parse events and format for display; capture session ID if emitted
   let sessionIdRef ← IO.mkRef (none : Option String)
   let outTask ← IO.asTask (prio := .dedicated) do
     let out ← IO.getStdout
     repeat do
       let line ← child.stdout.getLine
       if line.isEmpty then return
-      match StreamFormat.parseEvent line with
+      match agentDef.parseOutputLine line with
       | none => pure ()
       | some event =>
         if let .init sid _ := event then
@@ -173,8 +124,12 @@ def launchAgent (repoPath : System.FilePath) (prompt : String)
   let _ ← IO.wait outTask
   let _ ← IO.wait errTask
   let exitCode ← child.wait
-  -- Clean up MCP config
-  try IO.FS.removeFile mcpConfigPath catch _ => pure ()
-  return (exitCode, ← sessionIdRef.get)
+  -- If the stream didn't yield a session ID, ask the backend (e.g. read from log files)
+  let sessionId ← match ← sessionIdRef.get with
+    | some sid => pure (some sid)
+    | none     => agentDef.extractSessionId mcpContext
+  -- Clean up agent-specific resources (e.g. temp MCP config file)
+  agentDef.cleanup mcpContext
+  return (exitCode, sessionId)
 
 end Agent.Sandbox
