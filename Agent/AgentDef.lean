@@ -57,8 +57,25 @@ structure AgentDef where
   extractSessionId : String → IO (Option String)
   /-- Clean up any resources created by setupMcp. -/
   cleanup : String → IO Unit
+  /-- Return true if the agent exited because it hit a usage/quota limit.
+      Receives the process exit code and the full stderr content. -/
+  isUsageLimitError : UInt32 → String → Bool
 
 namespace AgentDef
+
+/-- Case-insensitive substring check. -/
+private def containsCI (haystack needle : String) : Bool :=
+  (haystack.toLower.splitOn needle.toLower).length > 1
+
+/-- Shared usage-limit detection patterns used by all backends. -/
+private def stdUsageLimitError (exitCode : UInt32) (stderr : String) : Bool :=
+  exitCode != 0 &&
+    let s := stderr.toLower
+    containsCI s "usage limit" ||
+    containsCI s "rate limit exceeded" ||
+    containsCI s "exceeded your" ||
+    containsCI s "insufficient credits" ||
+    containsCI s "credit balance"
 
 -- Claude
 
@@ -103,6 +120,7 @@ def claude : AgentDef where
   parseOutputLine := StreamFormat.parseEvent
   extractSessionId _ := pure none
   cleanup path := try IO.FS.removeFile (System.FilePath.mk path) catch _ => pure ()
+  isUsageLimitError := stdUsageLimitError
 
 -- Vibe
 
@@ -234,6 +252,9 @@ def vibe : AgentDef where
   parseOutputLine := vibeParseOutputLine
   extractSessionId := vibeExtractSessionId
   cleanup _ := pure ()
+  isUsageLimitError exitCode stderr :=
+    stdUsageLimitError exitCode stderr ||
+    (exitCode != 0 && containsCI stderr "quota exceeded")
 
 end AgentDef
 

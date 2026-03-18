@@ -11,10 +11,17 @@ private def expandHomePaths (rel : List String) : IO (List System.FilePath) := d
     let home := System.FilePath.mk h
     return rel.map (fun r => home / System.FilePath.mk r)
 
+/-- Result of launching an agent. -/
+structure LaunchResult where
+  exitCode      : UInt32
+  sessionId     : Option String
+  /-- True if the agent exited because it hit a usage or quota limit. -/
+  usageLimitHit : Bool
+
 /--
 Launch the coding agent inside a landrun sandbox.
 The agent backend's setupMcp hook runs before launch to configure MCP connectivity.
-Returns the exit code and the session ID captured from the agent's output (if any).
+Returns a LaunchResult with exit code, session ID, and usage-limit flag.
 -/
 private def shellEscape (s : String) : String :=
   if s.any (fun c => c == ' ' || c == '"' || c == '\'' || c == '\\' || c == '$' || c == '`'
@@ -32,7 +39,7 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
     (subAgent : Option String := none)
     (model : Option String := none)
     (systemPrompt : Option String := none)
-    (resume : Option String := none) : IO (UInt32 × Option String) := do
+    (resume : Option String := none) : IO LaunchResult := do
   -- Run agent-specific MCP setup (writes config files, returns extra env vars)
   let (mcpContext, agentEnv) ← agentDef.setupMcp serverPort model systemPrompt
   let paths := agentDef.sandboxPaths
@@ -112,12 +119,14 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
           sessionIdRef.set (some sid)
         out.putStrLn (StreamFormat.format event)
         out.flush
-  -- Stream stderr to console in a background thread
+  -- Stream stderr to console and capture it for usage-limit detection
+  let stderrRef ← IO.mkRef ""
   let errTask ← IO.asTask (prio := .dedicated) do
     let err ← IO.getStderr
     repeat do
       let line ← child.stderr.getLine
       if line.isEmpty then return
+      stderrRef.modify (· ++ line)
       err.putStr line
       err.flush
   -- Wait for streams to drain (EOF when child exits), then collect exit code
@@ -128,8 +137,11 @@ def launchAgent (agentDef : AgentDef) (repoPath : System.FilePath) (prompt : Str
   let sessionId ← match ← sessionIdRef.get with
     | some sid => pure (some sid)
     | none     => agentDef.extractSessionId mcpContext
+  -- Detect usage limit from exit code and captured stderr
+  let stderrContent ← stderrRef.get
+  let usageLimitHit := agentDef.isUsageLimitError exitCode stderrContent
   -- Clean up agent-specific resources (e.g. temp MCP config file)
   agentDef.cleanup mcpContext
-  return (exitCode, sessionId)
+  return { exitCode, sessionId, usageLimitHit }
 
 end Agent.Sandbox

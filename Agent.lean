@@ -1,6 +1,7 @@
 import Agent.AgentDef
 import Agent.Config
 import Agent.GitHub
+import Agent.Queue
 import Agent.Repo
 import Agent.RepoConfig
 import Agent.Sandbox

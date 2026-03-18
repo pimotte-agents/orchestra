@@ -17,10 +17,11 @@ private def stripExt (s ext : String) : String :=
 
 -- Task execution
 
-/-- Run a single task: clone repo, start MCP server, run validation loop. -/
+/-- Run a single task: clone repo, start MCP server, run validation loop.
+    Returns the task ID and whether the run was cut short by a usage limit. -/
 private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (continuesFrom : Option String := none)
-    (series : Option String := none) : IO Unit := do
+    (series : Option String := none) : IO (String × Bool) := do
   IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
@@ -29,6 +30,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     id := taskId, createdAt
     upstream := task.upstream, fork := task.fork, mode := task.mode, prompt := task.prompt
     continuesFrom, series
+    backend := task.backend, model := task.model, agent := task.agent
+    systemPrompt := task.systemPrompt
   }
   TaskStore.saveTask initialRecord
   -- Resolve initial resume session from the continued task
@@ -72,6 +75,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   -- 5. Validation loop: before.sh → agent → validation.sh, retry on failure
   let systemPrompt ← loadSystemPrompt task.systemPrompt
   let mut sessionId : Option String := none
+  let mut usageLimitHit := false
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
     RepoConfig.runHook repoPath "before.sh"
@@ -81,11 +85,15 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let agentDef := match task.backend with
       | some "vibe" => AgentDef.vibe
       | _           => AgentDef.claude
-    let (exitCode, sid) ← Sandbox.launchAgent agentDef repoPath prompt port token
+    let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
       (model := task.model) (systemPrompt := systemPrompt) (resume := resume)
-    IO.println s!"  Agent exited with code {exitCode}"
-    sessionId := sid
+    IO.println s!"  Agent exited with code {result.exitCode}"
+    sessionId := result.sessionId
+    if result.usageLimitHit then
+      IO.println "  Agent hit usage limit."
+      usageLimitHit := true
+      break
     let valid ← RepoConfig.runValidation repoPath
     if valid then break
     if attempt + 1 < maxAttempts then
@@ -96,10 +104,26 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   RepoConfig.runHook repoPath "after.sh"
   shutdown
   -- 7. Persist final task state
-  TaskStore.saveTask { initialRecord with sessionId, status := .completed }
+  let finalStatus := if usageLimitHit then .unfinished else .completed
+  TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
   IO.println s!"=== Task {idx} done ===\n"
+  return (taskId, usageLimitHit)
+
+-- Helpers
+
+/-- If `series` is already set, return it unchanged.
+    Otherwise, if `continuesFrom` references a task that belongs to a series,
+    inherit that series so the new task is automatically tagged. -/
+private def inheritSeries (continuesFrom : Option String) (series : Option String) :
+    IO (Option String) := do
+  match series with
+  | some _ => return series
+  | none =>
+    let some prevId := continuesFrom | return none
+    let some prev ← TaskStore.loadTask prevId | return none
+    return prev.series
 
 -- Handlers
 
@@ -126,9 +150,10 @@ private def runHandler (p : Parsed) : IO UInt32 := do
   if continuesFrom.isSome && tasks.size > 1 then
     IO.eprintln "--continues requires --task when the task file has multiple tasks"
     return (1 : UInt32)
+  let series ← inheritSeries continuesFrom series
   for i in [:tasks.size] do
     try
-      runTask appConfig tasks[i]! i debug (continuesFrom := continuesFrom) (series := series)
+      let _ ← runTask appConfig tasks[i]! i debug (continuesFrom := continuesFrom) (series := series)
     catch e =>
       IO.eprintln s!"Task {i} failed: {e}"
   return (0 : UInt32)
@@ -181,6 +206,7 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
   for r in records do
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
+      | .unfinished => "unfinished"
     IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {r.series.getD ""}"
   return (0 : UInt32)
 
@@ -193,6 +219,7 @@ private def taskShowHandler (p : Parsed) : IO UInt32 := do
   | some r =>
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
+      | .unfinished => "unfinished"
     let mode := match r.mode with | .fork => "fork" | .pr => "pr"
     IO.println s!"ID:             {r.id}"
     IO.println s!"Created:        {r.createdAt}"
@@ -249,12 +276,175 @@ private def resumeHandler (p : Parsed) : IO UInt32 := do
   let some prevRecord ← TaskStore.loadTask prevId
     | throw (.userError s!"task '{prevId}' not found in store")
   let task : Task := {
-    upstream := prevRecord.upstream
-    fork     := prevRecord.fork
-    mode     := prevRecord.mode
+    upstream     := prevRecord.upstream
+    fork         := prevRecord.fork
+    mode         := prevRecord.mode
     prompt
+    backend      := prevRecord.backend
+    model        := prevRecord.model
+    agent        := prevRecord.agent
+    systemPrompt := prevRecord.systemPrompt
   }
-  runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
+  let _ ← runTask appConfig task 0 debug (continuesFrom := some prevId) (series := some seriesName)
+  return (0 : UInt32)
+
+-- Queue helpers
+
+/-- Read the current process PID from /proc/self/stat (Linux-specific). -/
+private def getOwnPid : IO UInt32 := do
+  let stat ← IO.FS.readFile (System.FilePath.mk "/proc/self/stat")
+  match stat.splitOn " " with
+  | pid :: _ => return (pid.toNat?.getD 0).toUInt32
+  | _        => return 0
+
+private def enqueueHandler (p : Parsed) : IO UInt32 := do
+  let configPath    := p.flag? "config"    |>.map (·.as! String)
+  let taskIdx       := p.flag? "task"      |>.map (·.as! Nat)
+  let continuesFrom := p.flag? "continues" |>.map (·.as! String)
+  let series        := p.flag? "series"    |>.map (·.as! String)
+  let resumeSeries  := p.flag? "resume"    |>.map (·.as! String)
+  let prompt        := p.flag? "prompt"    |>.map (·.as! String)
+  let taskFile?     := (p.variableArgsAs? String |>.getD #[])[0]?
+  match resumeSeries, taskFile? with
+  | some _, some _ =>
+    IO.eprintln "Cannot use both a task file and --resume"
+    return 1
+  | none, none =>
+    IO.eprintln "Provide a task file or --resume <series> --prompt <text>"
+    return 1
+  | some seriesName, none =>
+    -- Series-continuation mode: inherit repo details from the latest task in the series
+    let promptText ← match prompt with
+      | some t => pure t
+      | none   => throw (.userError "missing required flag: --prompt")
+    let some prevId ← TaskStore.latestInSeries seriesName
+      | throw (.userError s!"series '{seriesName}' not found")
+    let some prevRecord ← TaskStore.loadTask prevId
+      | throw (.userError s!"task '{prevId}' not found in store")
+    let id ← TaskStore.generateId
+    let createdAt ← TaskStore.currentIso8601
+    let entry : Queue.QueueEntry := {
+      id, createdAt
+      upstream      := prevRecord.upstream
+      fork          := prevRecord.fork
+      mode          := prevRecord.mode
+      prompt        := promptText
+      continuesFrom := some prevId
+      series        := some seriesName
+      configPath
+      backend       := prevRecord.backend
+      model         := prevRecord.model
+      agent         := prevRecord.agent
+      systemPrompt  := prevRecord.systemPrompt
+    }
+    Queue.saveEntry entry
+    IO.println entry.id
+    return (0 : UInt32)
+  | none, some taskFile =>
+    -- Task-file mode: enqueue tasks from a JSON task file
+    let taskFileData ← loadTaskFile taskFile
+    if taskFileData.tasks.isEmpty then
+      IO.eprintln "No tasks found in task file"
+      return 1
+    let tasks := match taskIdx with
+      | some idx =>
+        if h : idx < taskFileData.tasks.size then #[taskFileData.tasks[idx]]
+        else #[]
+      | none => taskFileData.tasks
+    if tasks.isEmpty then
+      IO.eprintln "Task index out of range"
+      return 1
+    if continuesFrom.isSome && tasks.size > 1 then
+      IO.eprintln "--continues requires --task when the task file has multiple tasks"
+      return 1
+    let series ← inheritSeries continuesFrom series
+    for task in tasks do
+      let id ← TaskStore.generateId
+      let createdAt ← TaskStore.currentIso8601
+      let entry : Queue.QueueEntry := {
+        id, createdAt
+        upstream     := task.upstream
+        fork         := task.fork
+        mode         := task.mode
+        prompt       := task.prompt
+        agent        := task.agent
+        systemPrompt := task.systemPrompt
+        backend      := task.backend
+        model        := task.model
+        continuesFrom, series
+        configPath
+      }
+      Queue.saveEntry entry
+      IO.println entry.id
+    return (0 : UInt32)
+
+private def queueStartHandler (p : Parsed) : IO UInt32 := do
+  let configPath := p.flag? "config" |>.map (·.as! String)
+  let debug      := p.hasFlag "debug"
+  if ← Queue.daemonRunning then
+    IO.eprintln "Queue daemon is already running."
+    return 1
+  let pid ← getOwnPid
+  Queue.writePid pid
+  IO.println s!"Queue daemon started (PID {pid})"
+  -- Mark entries left in 'running' by a previously killed daemon as unfinished
+  Queue.markStaleRunningAsUnfinished
+  let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  repeat do
+    match ← Queue.nextPending with
+    | none => IO.sleep 2000
+    | some entry =>
+      Queue.saveEntry { entry with status := .running }
+      let task : Task := {
+        upstream     := entry.upstream
+        fork         := entry.fork
+        mode         := entry.mode
+        prompt       := entry.prompt
+        agent        := entry.agent
+        systemPrompt := entry.systemPrompt
+        backend      := entry.backend
+        model        := entry.model
+      }
+      let cfg ← match entry.configPath with
+        | none    => pure appConfig
+        | some cp => loadAppConfig (some (System.FilePath.mk cp))
+      try
+        let (taskId, usageLimitHit) ← runTask cfg task 0 debug
+          (continuesFrom := entry.continuesFrom) (series := entry.series)
+        if usageLimitHit then
+          Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
+          -- Cancel all other pending tasks using the same backend
+          Queue.cancelPendingByBackend entry.backend entry.id
+          -- Cancel queue entries that depend on this task's result
+          Queue.cancelDependents taskId
+          IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
+        else
+          Queue.saveEntry { entry with status := .done, taskId := some taskId }
+      catch e =>
+        IO.eprintln s!"Queue entry {entry.id} failed: {e}"
+        try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+  return (0 : UInt32)
+
+private def queueListHandler (p : Parsed) : IO UInt32 := do
+  let limit := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
+  if ← Queue.daemonRunning then
+    match ← Queue.readPid with
+    | some pid => IO.println s!"Daemon running (PID {pid})"
+    | none     => IO.println "Daemon running"
+  else
+    IO.println "Daemon not running"
+  let entries := (← Queue.loadAllEntries).toList.take limit
+  if entries.isEmpty then
+    IO.println "No queue entries found."
+    return (0 : UInt32)
+  IO.println ""
+  IO.println s!"{padRight "ID" 16} {padRight "CREATED" 20} {padRight "FORK" 28} {padRight "STATUS" 9} SERIES"
+  IO.println (String.ofList (List.replicate 85 '-'))
+  for e in entries do
+    let status := match e.status with
+      | .pending => "pending" | .running => "running" | .done => "done" | .failed => "failed"
+      | .unfinished => "unfinished" | .cancelled => "cancelled"
+    IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {e.series.getD ""}"
   return (0 : UInt32)
 
 -- CLI definitions
@@ -275,7 +465,7 @@ private def runCmd' : Cmd := `[Cli|
 ]
 
 private def mcpServerCmd : Cmd := `[Cli|
-  «mcp-server» VIA mcpServerHandler; ["0.1.0"]
+  mcp VIA mcpServerHandler; ["0.1.0"]
   "Start the MCP server and print the port it is listening on."
 
   FLAGS:
@@ -344,6 +534,95 @@ private def resumeCmd : Cmd := `[Cli|
     "series" : String; "Series name to resume"
 ]
 
+private def queueAddCmd : Cmd := `[Cli|
+  add VIA enqueueHandler; ["0.1.0"]
+  "Add tasks to the queue from a task file, or continue a series with a new prompt."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    t, task : Nat; "Enqueue only the task at this index (0-based, task-file mode only)"
+    continues : String; "Continue from a previous task by ID (task-file mode only)"
+    series : String; "Assign queued task(s) to a named series (task-file mode only)"
+    r, resume : String; "Continue the latest run in a named series (requires --prompt)"
+    p, prompt : String; "Prompt for the new agent run (used with --resume)"
+
+  ARGS:
+    ..."task-file" : String; "Path to the JSON task file (omit when using --resume)"
+]
+
+private def queueStartCmd : Cmd := `[Cli|
+  start VIA queueStartHandler; ["0.1.0"]
+  "Start the queue daemon. Polls for pending tasks and runs them serially."
+
+  FLAGS:
+    c, config : String; "Path to config file (default: ~/.agent/config.json)"
+    d, debug; "Print the landrun command before executing it"
+]
+
+private def queueRetryHandler (p : Parsed) : IO UInt32 := do
+  let seriesFilter := p.flag? "series" |>.map (·.as! String)
+  let all ← Queue.loadAllEntries
+  -- Collect unfinished and cancelled entries, optionally filtered by series,
+  -- reversed so we enqueue them in original (oldest-first) order
+  let retryable := (all.filter (fun e =>
+    (e.status == .unfinished || e.status == .cancelled) &&
+    match seriesFilter with
+    | none   => true
+    | some s => e.series == some s)).toList.reverse
+  if retryable.isEmpty then
+    IO.println "No unfinished or cancelled entries to retry."
+    return (0 : UInt32)
+  for entry in retryable do
+    let id ← TaskStore.generateId
+    let createdAt ← TaskStore.currentIso8601
+    -- Unfinished tasks: continue from their partial session (taskId).
+    -- Cancelled tasks: keep the original continuesFrom (they never ran).
+    let continuesFrom := match entry.status with
+      | .unfinished => entry.taskId
+      | _           => entry.continuesFrom
+    let newEntry : Queue.QueueEntry := {
+      id, createdAt
+      upstream     := entry.upstream
+      fork         := entry.fork
+      mode         := entry.mode
+      prompt       := entry.prompt
+      agent        := entry.agent
+      systemPrompt := entry.systemPrompt
+      backend      := entry.backend
+      model        := entry.model
+      continuesFrom
+      series       := entry.series
+      configPath   := entry.configPath
+    }
+    Queue.saveEntry newEntry
+    IO.println newEntry.id
+  return (0 : UInt32)
+
+private def queueRetryCmd : Cmd := `[Cli|
+  retry VIA queueRetryHandler; ["0.1.0"]
+  "Re-enqueue all unfinished and cancelled queue entries."
+
+  FLAGS:
+    series : String; "Only retry entries belonging to this series"
+]
+
+private def queueDefaultHandler (_ : Parsed) : IO UInt32 := do
+  IO.eprintln "Use a subcommand. Try 'agent queue --help'."
+  return 1
+
+private def queueCmd : Cmd := `[Cli|
+  queue VIA queueListHandler; ["0.1.0"]
+  "Manage the task queue."
+
+  FLAGS:
+    limit : Nat; "Maximum number of entries to show (default: 20)"
+
+  SUBCOMMANDS:
+    queueAddCmd;
+    queueStartCmd;
+    queueRetryCmd
+]
+
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
   IO.eprintln "Use a subcommand. Try 'agent --help'."
   return 1
@@ -361,7 +640,8 @@ def agentCmd : Cmd := `[Cli|
     taskCmd;
     seriesCmd;
     tagCmd;
-    resumeCmd
+    resumeCmd;
+    queueCmd
 ]
 
 def main (args : List String) : IO UInt32 :=
