@@ -76,3 +76,17 @@ pullrequests on the upstream repository).
   Later, this feature should be extended to support a queue mode. For this there should be a subcommand that launches
   a process that listens to new tasks on a queue. A further subcommand can add new tasks to the queue using the
   established format, possibly referencing a task series name (as described above) or a task id.
+
+- Listeners: There should be a way to setup listeners. These listeners can be activated when starting the
+  queue daemon. A listener should regularly check for new tasks from configurable sources. A listener
+  consists of two components:
+  * a source whose output is some text (see below, e.g. output could be the review comments or simply an issue number)
+  * a configurable action taking in the input from the source. The action should be provided as a .json file
+    that defines what task is sent to the queue depending on the source
+
+  Possible sources:
+  * Github issues
+  * reviews of pull requests on Github
+
+  It should be extensible by providing shell scripts for sources, but the two sources above should come pre-configured
+  (and implemented in Lean as part of orchestra).

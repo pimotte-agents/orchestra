@@ -379,8 +379,9 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
     return (0 : UInt32)
 
 private def queueStartHandler (p : Parsed) : IO UInt32 := do
-  let configPath := p.flag? "config" |>.map (·.as! String)
-  let debug      := p.hasFlag "debug"
+  let configPath   := p.flag? "config"       |>.map (·.as! String)
+  let listenerDir  := p.flag? "listener_dir" |>.map (·.as! String)
+  let debug        := p.hasFlag "debug"
   if ← Queue.daemonRunning then
     IO.eprintln "Queue daemon is already running."
     return 1
@@ -390,9 +391,28 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   -- Mark entries left in 'running' by a previously killed daemon as unfinished
   Queue.markStaleRunningAsUnfinished
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  -- Load listener configs
+  let lDir ← match listenerDir with
+    | some d => pure (System.FilePath.mk d)
+    | none   => Listener.listenersDir
+  let listenerConfigs ← Listener.loadAllListenerConfigs lDir
+  if !listenerConfigs.isEmpty then
+    IO.println s!"Loaded {listenerConfigs.size} listener(s) from {lDir}"
+  -- Next-poll timestamps: (listenerName, nextPollNanos) pairs. Nat matches IO.monoNanosNow.
+  -- Initialised empty so every listener fires on the first iteration (due = 0).
+  let nextPollRef ← IO.mkRef (Array.empty : Array (String × Nat))
+  -- Helper: look up due time for a listener (0 = always due)
+  let getDue (arr : Array (String × Nat)) (name : String) : Nat :=
+    arr.find? (fun p => p.1 == name) |>.map (·.2) |>.getD 0
+  -- Helper: upsert due time
+  let setDue (arr : Array (String × Nat)) (name : String) (t : Nat) : Array (String × Nat) :=
+    match arr.findIdx? (fun p => p.1 == name) with
+    | some i => arr.set! i (name, t)
+    | none   => arr.push (name, t)
   repeat do
+    -- Run the next pending queue entry (if any)
     match ← Queue.nextPending with
-    | none => IO.sleep 2000
+    | none => pure ()
     | some entry =>
       Queue.saveEntry { entry with status := .running }
       let task : Task := {
@@ -413,9 +433,7 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
           (continuesFrom := entry.continuesFrom) (series := entry.series)
         if usageLimitHit then
           Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
-          -- Cancel all other pending tasks using the same backend
           Queue.cancelPendingByBackend entry.backend entry.id
-          -- Cancel queue entries that depend on this task's result
           Queue.cancelDependents taskId
           IO.println s!"  Cancelled pending {entry.backend.getD "claude"} tasks and dependents."
         else
@@ -423,6 +441,33 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       catch e =>
         IO.eprintln s!"Queue entry {entry.id} failed: {e}"
         try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+    -- Poll each listener whose interval has elapsed
+    let now ← IO.monoNanosNow
+    let nextPoll ← nextPollRef.get
+    for lcfg in listenerConfigs do
+      let due := getDue nextPoll lcfg.name
+      if now >= due then
+        try
+          let state  ← Listener.loadListenerState lcfg.name
+          let events ← Listener.pollSource lcfg.source state appConfig.pat
+          for ev in (events : Array (String × List (String × String))) do
+            let qentry ← Listener.buildQueueEntry lcfg.action ev.2
+            Queue.saveEntry qentry
+            IO.println s!"  Listener '{lcfg.name}': queued entry {qentry.id}"
+          -- Update state: record processed IDs and last-checked timestamp
+          let newIds   := events.filterMap (fun ev =>
+            if (ev.1 : String).isEmpty then none else some ev.1)
+          let newState : Listener.ListenerState := {
+            lastChecked  := ← TaskStore.currentIso8601
+            processedIds := state.processedIds ++ newIds
+          }
+          Listener.saveListenerState lcfg.name newState
+        catch e =>
+          IO.eprintln s!"  Listener '{lcfg.name}' poll error: {e}"
+        -- Schedule next poll regardless of success/failure
+        let intervalNanos := lcfg.intervalSeconds * 1_000_000_000
+        nextPollRef.modify (setDue · lcfg.name (now + intervalNanos))
+    IO.sleep 2000
   return (0 : UInt32)
 
 private def queueListHandler (p : Parsed) : IO UInt32 := do
@@ -445,6 +490,25 @@ private def queueListHandler (p : Parsed) : IO UInt32 := do
       | .pending => "pending" | .running => "running" | .done => "done" | .failed => "failed"
       | .unfinished => "unfinished" | .cancelled => "cancelled"
     IO.println s!"{padRight e.id 16} {padRight e.createdAt 20} {padRight e.fork 28} {padRight status 10} {e.series.getD ""}"
+  return (0 : UInt32)
+
+private def queueListenersHandler (p : Parsed) : IO UInt32 := do
+  let listenerDir := p.flag? "listener_dir" |>.map (·.as! String)
+  let lDir ← match listenerDir with
+    | some d => pure (System.FilePath.mk d)
+    | none   => Listener.listenersDir
+  let configs ← Listener.loadAllListenerConfigs lDir
+  if configs.isEmpty then
+    IO.println s!"No listeners found in {lDir}"
+    return (0 : UInt32)
+  IO.println s!"{padRight "LISTENER" 20} {padRight "INTERVAL" 9} {padRight "LAST CHECKED" 22} PROCESSED"
+  IO.println (String.ofList (List.replicate 70 '-'))
+  for cfg in configs do
+    let state ← Listener.loadListenerState cfg.name
+    let lastChecked := if state.lastChecked.isEmpty then "never" else state.lastChecked
+    let processed   := toString state.processedIds.size ++ " events"
+    let interval    := s!"{cfg.intervalSeconds}s"
+    IO.println s!"{padRight cfg.name 20} {padRight interval 9} {padRight lastChecked 22} {processed}"
   return (0 : UInt32)
 
 -- CLI definitions
@@ -557,6 +621,7 @@ private def queueStartCmd : Cmd := `[Cli|
   FLAGS:
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
     d, debug; "Print the landrun command before executing it"
+    listener_dir : String; "Directory of listener configs (default: ~/.agent/listeners/)"
 ]
 
 private def queueRetryHandler (p : Parsed) : IO UInt32 := do
@@ -606,9 +671,13 @@ private def queueRetryCmd : Cmd := `[Cli|
     series : String; "Only retry entries belonging to this series"
 ]
 
-private def queueDefaultHandler (_ : Parsed) : IO UInt32 := do
-  IO.eprintln "Use a subcommand. Try 'agent queue --help'."
-  return 1
+private def queueListenersCmd : Cmd := `[Cli|
+  listeners VIA queueListenersHandler; ["0.1.0"]
+  "List configured listeners and their polling state."
+
+  FLAGS:
+    listener_dir : String; "Directory of listener configs (default: ~/.agent/listeners/)"
+]
 
 private def queueCmd : Cmd := `[Cli|
   queue VIA queueListHandler; ["0.1.0"]
@@ -620,7 +689,8 @@ private def queueCmd : Cmd := `[Cli|
   SUBCOMMANDS:
     queueAddCmd;
     queueStartCmd;
-    queueRetryCmd
+    queueRetryCmd;
+    queueListenersCmd
 ]
 
 private def defaultHandler (_ : Parsed) : IO UInt32 := do
