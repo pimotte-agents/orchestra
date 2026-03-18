@@ -1,2 +1,4 @@
 /.lake
 tasks.json
+container/*.squashfs
+container/*.tar.xz
