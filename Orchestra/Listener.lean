@@ -221,6 +221,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
   let id        ← TaskStore.generateId
   let createdAt ← TaskStore.currentIso8601
   let prompt    := renderTemplate action.promptTemplate vars
+  let series    := action.series.map (renderTemplate · vars)
   let mode      := action.mode
   IO.eprintln s!"[listener] buildQueueEntry: model={repr action.model} budget={repr action.budget} agent={repr action.agent}"
   return {
@@ -233,7 +234,7 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     systemPrompt := action.systemPrompt
     backend      := action.backend
     model        := action.model
-    series       := action.series
+    series
     budget       := action.budget
   }
 
