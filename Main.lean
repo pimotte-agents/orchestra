@@ -1,8 +1,12 @@
 import Orchestra
 import Cli
+import Std.Sync
 
 open Cli
 open Orchestra
+
+/-- Raw command-line args stored at startup so background re-exec can reconstruct them. -/
+initialize gRawArgs : IO.Ref (List String) ← IO.mkRef []
 
 -- Helpers
 
@@ -20,13 +24,18 @@ private def stripExt (s ext : String) : String :=
     s.dropEnd ext.length |>.toString
   else s
 
+/-- Single-quote a string for safe use in a POSIX shell command. -/
+private def shellQuote (s : String) : String :=
+  "'" ++ s.replace "'" "'\\''" ++ "'"
+
 -- Task execution
 
 /-- Run a single task: clone repo, start MCP server, run validation loop.
     Returns the task ID and whether the run was cut short by a usage limit. -/
 private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : Bool)
     (continuesFrom : Option String := none)
-    (series : Option String := none) : IO (String × Bool) := do
+    (series : Option String := none)
+    (cancelToken : Option Std.CancellationToken := none) : IO (String × Bool) := do
   IO.println s!"=== Task {idx}: {task.fork} ({repr task.mode}) ==="
   -- Record this run in the task store
   let taskId ← TaskStore.generateId
@@ -81,6 +90,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   let systemPrompt ← loadSystemPrompt task.systemPrompt
   let mut sessionId : Option String := none
   let mut usageLimitHit := false
+  let mut wasCancelled := false
   let maxAttempts := repoConfig.validation.maxRetries + 1
   for attempt in List.range maxAttempts do
     RepoConfig.runHook repoPath "before.sh"
@@ -93,9 +103,13 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
     let result ← Sandbox.launchAgent agentDef repoPath prompt port token
       (debug := debug) (pluginDirs := appConfig.pluginDirs) (subAgent := task.agent)
       (model := task.model) (systemPrompt := systemPrompt) (resume := resume)
-      (budget := task.budget.getD 4.0)
+      (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
+    if result.wasCancelled then
+      IO.println "  Agent was cancelled."
+      wasCancelled := true
+      break
     if result.usageLimitHit then
       IO.println "  Agent hit usage limit."
       usageLimitHit := true
@@ -110,7 +124,10 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
   RepoConfig.runHook repoPath "after.sh"
   shutdown
   -- 7. Persist final task state
-  let finalStatus := if usageLimitHit then .unfinished else .completed
+  let finalStatus :=
+    if wasCancelled then .cancelled
+    else if usageLimitHit then .unfinished
+    else .completed
   TaskStore.saveTask { initialRecord with sessionId, status := finalStatus }
   if let some seriesName := series then
     TaskStore.updateSeriesPointer seriesName taskId
@@ -217,7 +234,7 @@ private def tasksHandler (p : Parsed) : IO UInt32 := do
   for r in records do
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
-      | .unfinished => "unfinished"
+      | .unfinished => "unfinished" | .cancelled => "cancelled"
     IO.println s!"{padRight r.id 16} {padRight r.createdAt 20} {padRight r.fork 28} {padRight status 11} {r.series.getD ""}"
   return (0 : UInt32)
 
@@ -230,7 +247,7 @@ private def taskShowHandler (p : Parsed) : IO UInt32 := do
   | some r =>
     let status := match r.status with
       | .running => "running" | .completed => "completed" | .failed => "failed"
-      | .unfinished => "unfinished"
+      | .unfinished => "unfinished" | .cancelled => "cancelled"
     let mode := match r.mode with | .fork => "fork" | .pr => "pr"
     IO.println s!"ID:             {r.id}"
     IO.println s!"Created:        {r.createdAt}"
@@ -398,6 +415,47 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   let configPath   := p.flag? "config"       |>.map (·.as! String)
   let listenerDir  := p.flag? "listener_dir" |>.map (·.as! String)
   let debug        := p.hasFlag "debug"
+  let background   := p.hasFlag "background"
+  -- Background mode: re-exec as a detached daemon and exit
+  if background then
+    if ← Queue.daemonRunning then
+      IO.eprintln "Queue daemon is already running."
+      return 1
+    let rawArgs ← gRawArgs.get
+    let filteredArgs := rawArgs.filter (fun s => s != "--background" && s != "-b")
+    let dir ← Queue.queueDir
+    IO.FS.createDirAll dir
+    let logFile ← Queue.daemonLogFile
+    let exePath ← IO.appPath
+    let quotedArgs := filteredArgs.map shellQuote |> String.intercalate " "
+    let shellCmd :=
+      s!"exec {shellQuote exePath.toString} {quotedArgs} >> {shellQuote logFile.toString} 2>&1 & echo $!"
+    let launcher ← IO.Process.spawn {
+      cmd := "sh"
+      args := #["-c", shellCmd]
+      stdin := .null
+      stdout := .piped
+      stderr := .null
+    }
+    let _ ← launcher.stdout.readToEnd
+    let _ ← launcher.wait
+    -- Wait up to 3 seconds for the daemon to write its own PID file
+    let rec waitForDaemon : Nat → IO Bool
+      | 0 => return false
+      | n + 1 => do
+        IO.sleep 300
+        if ← Queue.daemonRunning then return true
+        waitForDaemon n
+    if ← waitForDaemon 10 then
+      let pid := (← Queue.readPid).getD 0
+      IO.println s!"Queue daemon started in background (PID {pid}), log: {logFile}"
+      return 0
+    else
+      IO.eprintln "Queue daemon failed to start. Log output:"
+      let log ← try IO.FS.readFile logFile catch _ => pure "(log file not found)"
+      IO.eprintln log
+      return 1
+  -- Foreground mode
   if ← Queue.daemonRunning then
     IO.eprintln "Queue daemon is already running."
     return 1
@@ -406,7 +464,27 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
   IO.println s!"Queue daemon started (PID {pid})"
   -- Mark entries left in 'running' by a previously killed daemon as unfinished
   Queue.markStaleRunningAsUnfinished
+  -- Clear any sentinel files left over from a previous run
+  Queue.clearShutdownRequest
+  Queue.clearCancelRequest
   let appConfig ← loadAppConfig (configPath.map System.FilePath.mk)
+  -- Shutdown token: cancelled by the file watcher when shutdown.request appears
+  let shutdownToken ← Std.CancellationToken.new
+  -- Current task cancel token: set while a task is running, read by the file watcher
+  let currentTaskToken ← Std.Mutex.new (none : Option Std.CancellationToken)
+  -- File watcher task: polls sentinel files every 500ms and updates tokens.
+  -- This is the only place that reads the filesystem for control signals.
+  let _watcher ← IO.asTask (prio := .dedicated) do
+    while !(← shutdownToken.isCancelled) do
+      IO.sleep 500
+      if ← Queue.checkCancelRequested then
+        Queue.clearCancelRequest
+        let optToken ← currentTaskToken.atomically (·.get)
+        if let some token := optToken then
+          token.cancel .cancel
+      if ← Queue.checkShutdownRequested then
+        Queue.clearShutdownRequest
+        shutdownToken.cancel .shutdown
   -- Load listener configs
   let lDir ← match listenerDir with
     | some d => pure (System.FilePath.mk d)
@@ -425,11 +503,18 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
     match arr.findIdx? (fun p => p.1 == name) with
     | some i => arr.set! i (name, t)
     | none   => arr.push (name, t)
-  repeat do
+  try
+  while true do
+    -- Check for graceful shutdown request between tasks
+    if ← shutdownToken.isCancelled then
+      break
     -- Run the next pending queue entry (if any)
     match ← Queue.nextPending with
     | none => pure ()
     | some entry =>
+      -- Create a fresh cancel token for this task
+      let taskToken ← Std.CancellationToken.new
+      currentTaskToken.atomically (·.set (some taskToken))
       Queue.saveEntry { entry with status := .running }
       let task : Task := {
         upstream     := entry.upstream
@@ -448,7 +533,12 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
       try
         let (taskId, usageLimitHit) ← runTask cfg task 0 debug
           (continuesFrom := entry.continuesFrom) (series := entry.series)
-        if usageLimitHit then
+          (cancelToken := some taskToken)
+        currentTaskToken.atomically (·.set none)
+        if ← taskToken.isCancelled then
+          Queue.saveEntry { entry with status := .cancelled, taskId := some taskId }
+          IO.println s!"  Task cancelled."
+        else if usageLimitHit then
           Queue.saveEntry { entry with status := .unfinished, taskId := some taskId }
           Queue.cancelPendingByBackend entry.backend entry.id
           Queue.cancelDependents taskId
@@ -456,8 +546,13 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         else
           Queue.saveEntry { entry with status := .done, taskId := some taskId }
       catch e =>
-        IO.eprintln s!"Queue entry {entry.id} failed: {e}"
-        try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
+        currentTaskToken.atomically (·.set none)
+        if ← taskToken.isCancelled then
+          IO.eprintln s!"  Task cancelled (with error: {e})"
+          try Queue.saveEntry { entry with status := .cancelled } catch _ => pure ()
+        else
+          IO.eprintln s!"Queue entry {entry.id} failed: {e}"
+          try Queue.saveEntry { entry with status := .failed } catch _ => pure ()
     -- Poll each listener whose interval has elapsed
     let now ← IO.monoNanosNow
     let nextPoll ← nextPollRef.get
@@ -485,7 +580,11 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         let intervalNanos := lcfg.intervalSeconds * 1_000_000_000
         nextPollRef.modify (setDue · lcfg.name (now + intervalNanos))
     IO.sleep 2000
-  return (0 : UInt32)
+  -- Graceful shutdown: remaining pending tasks stay queued for next restart
+  finally
+    Queue.deletePid
+  IO.println "Queue daemon shut down gracefully."
+  return 0
 
 private def queueListHandler (p : Parsed) : IO UInt32 := do
   let limit := p.flag? "limit" |>.map (·.as! Nat) |>.getD 20
@@ -527,6 +626,55 @@ private def queueListenersHandler (p : Parsed) : IO UInt32 := do
     let interval    := s!"{cfg.intervalSeconds}s"
     IO.println s!"{padRight cfg.name 20} {padRight interval 9} {padRight lastChecked 22} {processed}"
   return (0 : UInt32)
+
+private def queueStatusHandler (_ : Parsed) : IO UInt32 := do
+  -- Daemon status
+  if ← Queue.daemonRunning then
+    match ← Queue.readPid with
+    | some pid => IO.println s!"Daemon: running (PID {pid})"
+    | none     => IO.println "Daemon: running"
+  else
+    IO.println "Daemon: not running"
+  -- Running and pending entries only
+  let all ← Queue.loadAllEntries
+  let active := all.filter (fun e => e.status == .running || e.status == .pending)
+  if active.isEmpty then
+    IO.println "Queue: empty"
+    return 0
+  IO.println s!"Queue: {active.size} task(s)"
+  IO.println ""
+  IO.println s!"{padRight "ID" 16} {padRight "FORK" 32} {padRight "STATUS" 9} SERIES"
+  IO.println (String.ofList (List.replicate 70 '-'))
+  -- Show running first, then pending in oldest-first order
+  let running := active.filter (fun e => e.status == .running)
+  let pending := (active.filter (fun e => e.status == .pending)).toList.reverse.toArray
+  for e in running ++ pending do
+    let status := if e.status == .running then "running" else "pending"
+    IO.println s!"{padRight e.id 16} {padRight e.fork 32} {padRight status 9} {e.series.getD ""}"
+  return 0
+
+private def queueShutdownHandler (p : Parsed) : IO UInt32 := do
+  let force := p.hasFlag "force"
+  if !(← Queue.daemonRunning) then
+    IO.eprintln "Queue daemon is not running."
+    return 1
+  if force then
+    Queue.requestCancel
+    IO.println "Sent cancel request."
+  Queue.requestShutdown
+  if force then
+    IO.println "Sent shutdown request. Daemon will stop after cancelling the current task."
+  else
+    IO.println "Sent shutdown request. Daemon will stop after the current task finishes."
+  return 0
+
+private def queueCancelHandler (_ : Parsed) : IO UInt32 := do
+  if !(← Queue.daemonRunning) then
+    IO.eprintln "Queue daemon is not running."
+    return 1
+  Queue.requestCancel
+  IO.println "Cancel request sent. The current task will be stopped."
+  return 0
 
 -- CLI definitions
 
@@ -642,6 +790,25 @@ private def queueStartCmd : Cmd := `[Cli|
     c, config : String; "Path to config file (default: ~/.agent/config.json)"
     d, debug; "Print the landrun command before executing it"
     listener_dir : String; "Directory of listener configs (default: ~/.agent/listeners/)"
+    b, background; "Run the daemon in the background, detached from the terminal"
+]
+
+private def queueStatusCmd : Cmd := `[Cli|
+  status VIA queueStatusHandler; ["0.1.0"]
+  "Show daemon status and currently queued tasks."
+]
+
+private def queueShutdownCmd : Cmd := `[Cli|
+  shutdown VIA queueShutdownHandler; ["0.1.0"]
+  "Stop the queue daemon gracefully after the current task finishes."
+
+  FLAGS:
+    f, force; "Cancel the current task immediately and shut down"
+]
+
+private def queueCancelCmd : Cmd := `[Cli|
+  cancel VIA queueCancelHandler; ["0.1.0"]
+  "Cancel the currently running task (daemon continues with remaining queued tasks)."
 ]
 
 private def queueRetryHandler (p : Parsed) : IO UInt32 := do
@@ -709,6 +876,9 @@ private def queueCmd : Cmd := `[Cli|
   SUBCOMMANDS:
     queueAddCmd;
     queueStartCmd;
+    queueStatusCmd;
+    queueShutdownCmd;
+    queueCancelCmd;
     queueRetryCmd;
     queueListenersCmd
 ]
@@ -734,5 +904,6 @@ def orchestraCmd : Cmd := `[Cli|
     queueCmd
 ]
 
-def main (args : List String) : IO UInt32 :=
+def main (args : List String) : IO UInt32 := do
+  gRawArgs.set args
   orchestraCmd.validate args

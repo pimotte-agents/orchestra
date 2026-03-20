@@ -111,6 +111,35 @@ def queueDir : IO System.FilePath := do
 def pidFile : IO System.FilePath :=
   return (← queueDir) / "daemon.pid"
 
+def shutdownRequestFile : IO System.FilePath :=
+  return (← queueDir) / "shutdown.request"
+
+def cancelRequestFile : IO System.FilePath :=
+  return (← queueDir) / "cancel.request"
+
+def daemonLogFile : IO System.FilePath :=
+  return (← queueDir) / "daemon.log"
+
+/-- Write a graceful-shutdown sentinel. The daemon will exit after the current task finishes. -/
+def requestShutdown : IO Unit := do
+  IO.FS.writeFile (← shutdownRequestFile) ""
+
+/-- Write a cancel sentinel. The daemon will kill the currently running agent. -/
+def requestCancel : IO Unit := do
+  IO.FS.writeFile (← cancelRequestFile) ""
+
+def checkShutdownRequested : IO Bool := do
+  (← shutdownRequestFile).pathExists
+
+def checkCancelRequested : IO Bool := do
+  (← cancelRequestFile).pathExists
+
+def clearShutdownRequest : IO Unit := do
+  try IO.FS.removeFile (← shutdownRequestFile) catch _ => pure ()
+
+def clearCancelRequest : IO Unit := do
+  try IO.FS.removeFile (← cancelRequestFile) catch _ => pure ()
+
 -- Storage
 
 def saveEntry (entry : QueueEntry) : IO Unit := do

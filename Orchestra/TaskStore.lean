@@ -14,6 +14,8 @@ inductive TaskStatus where
   | failed
   /-- The agent run was interrupted (e.g. usage limit hit or daemon stopped). -/
   | unfinished
+  /-- The agent run was cancelled by the user via `queue cancel`. -/
+  | cancelled
 deriving Repr
 
 instance : ToJson TaskStatus where
@@ -22,6 +24,7 @@ instance : ToJson TaskStatus where
     | .completed  => "completed"
     | .failed     => "failed"
     | .unfinished => "unfinished"
+    | .cancelled  => "cancelled"
 
 instance : FromJson TaskStatus where
   fromJson?
@@ -29,6 +32,7 @@ instance : FromJson TaskStatus where
     | .str "completed"  => .ok .completed
     | .str "failed"     => .ok .failed
     | .str "unfinished" => .ok .unfinished
+    | .str "cancelled"  => .ok .cancelled
     | j => .error s!"expected task status string, got {j}"
 
 structure TaskRecord where
