@@ -84,6 +84,18 @@ structure AppConfig where
   installationId : Option Nat := none
   pat : String := ""
   pluginDirs : Array String := #[]
+  /-- Long-lived Claude OAuth token set via `claude setup-token`.
+      Exposed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. -/
+  claudeToken : Option String := none
+  /-- Anthropic API key passed to the agent as ANTHROPIC_API_KEY. -/
+  anthropicApiKey : Option String := none
+  /-- Anthropic base URL passed to the agent as ANTHROPIC_BASE_URL. -/
+  anthropicBaseUrl : Option String := none
+  /-- Anthropic auth token passed to the agent as ANTHROPIC_AUTH_TOKEN. -/
+  anthropicAuthToken : Option String := none
+  /-- GitHub logins allowed to trigger any listener. Empty = allow everyone.
+      Can be overridden per listener via `authorized_users` in the source config. -/
+  authorizedUsers : List String := []
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -97,7 +109,13 @@ instance : FromJson AppConfig where
       gh.getObjValAs? String "pat"
     ) |>.toOption |>.getD ""
     let pluginDirs := j.getObjValAs? (Array String) "plugin_dirs" |>.toOption |>.getD #[]
-    return { appId, privateKeyPath, installationId, pat, pluginDirs }
+    let claudeToken := j.getObjValAs? String "claude_token" |>.toOption
+    let anthropicApiKey := j.getObjValAs? String "anthropic_api_key" |>.toOption
+    let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
+    let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
+    let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+    return { appId, privateKeyPath, installationId, pat, pluginDirs,
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers }
 
 structure TaskFile where
   tasks : Array Task
