@@ -84,6 +84,9 @@ structure AppConfig where
   installationId : Option Nat := none
   pat : String := ""
   pluginDirs : Array String := #[]
+  /-- Long-lived Claude OAuth token set via `claude setup-token`.
+      Exposed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. -/
+  claudeToken : Option String := none
   /-- Anthropic API key passed to the agent as ANTHROPIC_API_KEY. -/
   anthropicApiKey : Option String := none
   /-- Anthropic base URL passed to the agent as ANTHROPIC_BASE_URL. -/
@@ -103,11 +106,12 @@ instance : FromJson AppConfig where
       gh.getObjValAs? String "pat"
     ) |>.toOption |>.getD ""
     let pluginDirs := j.getObjValAs? (Array String) "plugin_dirs" |>.toOption |>.getD #[]
+    let claudeToken := j.getObjValAs? String "claude_token" |>.toOption
     let anthropicApiKey := j.getObjValAs? String "anthropic_api_key" |>.toOption
     let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
-             anthropicApiKey, anthropicBaseUrl, anthropicAuthToken }
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken }
 
 structure TaskFile where
   tasks : Array Task
