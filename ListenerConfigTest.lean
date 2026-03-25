@@ -73,11 +73,38 @@ def main : IO Unit := do
   "#
   match Json.parse issuesFormat >>= FromJson.fromJson? (α := SourceConfig) with
   | .error e => fail s!"github-issues new format: {e}"
-  | .ok (.githubIssues repos labels authorizedUsers) =>
+  | .ok (.githubIssues repos labels trigger authorizedUsers) =>
     expectEq "github-issues repos length"      2         repos.length
     expectEq "github-issues labels"            ["bug"]   labels
+    expectEq "github-issues trigger default"   ""        trigger
     expectEq "github-issues authorized_users"  ["carol"] authorizedUsers
   | .ok _ => fail "github-issues: unexpected SourceConfig variant"
+
+  -- Test 4b: github-issues with trigger
+  let issuesWithTriggerFormat := r#"
+    {"type": "github-issues",
+     "repos": [{"upstream": "org/repo", "repo": "my-org/fork"}],
+     "trigger": "@bot",
+     "authorized_users": []}
+  "#
+  match Json.parse issuesWithTriggerFormat >>= FromJson.fromJson? (α := SourceConfig) with
+  | .error e => fail s!"github-issues with trigger: {e}"
+  | .ok (.githubIssues _repos _labels trigger _authorizedUsers) =>
+    expectEq "github-issues trigger"  "@bot" trigger
+  | .ok _ => fail "github-issues with trigger: unexpected SourceConfig variant"
+
+  -- Test 4c: github-pr-reviews with trigger
+  let reviewsWithTriggerFormat := r#"
+    {"type": "github-pr-reviews",
+     "repos": [{"upstream": "org/repo", "repo": "my-org/fork"}],
+     "trigger": "@orchestra",
+     "authorized_users": []}
+  "#
+  match Json.parse reviewsWithTriggerFormat >>= FromJson.fromJson? (α := SourceConfig) with
+  | .error e => fail s!"github-pr-reviews with trigger: {e}"
+  | .ok (.githubPrReviews _repos _labels trigger _authorizedUsers) =>
+    expectEq "github-pr-reviews trigger"  "@orchestra" trigger
+  | .ok _ => fail "github-pr-reviews with trigger: unexpected SourceConfig variant"
 
   -- Test 5: github-pr-reviews with new repos format
   let reviewsFormat := r#"
@@ -87,8 +114,9 @@ def main : IO Unit := do
   "#
   match Json.parse reviewsFormat >>= FromJson.fromJson? (α := SourceConfig) with
   | .error e => fail s!"github-pr-reviews new format: {e}"
-  | .ok (.githubPrReviews repos _labels authorizedUsers) =>
+  | .ok (.githubPrReviews repos _labels trigger authorizedUsers) =>
     expectEq "github-pr-reviews repos length"      1  repos.length
+    expectEq "github-pr-reviews trigger default"   "" trigger
     expectEq "github-pr-reviews authorized_users"  [] authorizedUsers
   | .ok _ => fail "github-pr-reviews: unexpected SourceConfig variant"
 

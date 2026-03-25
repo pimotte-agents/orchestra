@@ -30,11 +30,15 @@ instance : FromJson RepoEntry where
 
 inductive SourceConfig where
   /-- Poll open issues. Optionally filtered by `labels`.
+      If `trigger` is non-empty, only issues whose body contains `trigger` will fire.
       Only users in `authorizedUsers` may trigger (empty = allow all). -/
-  | githubIssues    (repos : List RepoEntry) (labels : List String) (authorizedUsers : List String)
+  | githubIssues    (repos : List RepoEntry) (labels : List String) (trigger : String)
+                    (authorizedUsers : List String)
   /-- Poll PR reviews. Optionally filtered by `labels`.
+      If `trigger` is non-empty, only reviews whose body contains `trigger` will fire.
       Only users in `authorizedUsers` may trigger (empty = allow all). -/
-  | githubPrReviews (repos : List RepoEntry) (labels : List String) (authorizedUsers : List String)
+  | githubPrReviews (repos : List RepoEntry) (labels : List String) (trigger : String)
+                    (authorizedUsers : List String)
   /-- Reacts to new issue/PR comments containing `trigger` with a rocket emoji and enqueues a task.
       Only users in `authorizedUsers` may trigger (empty = allow all). -/
   | githubComments  (repos : List RepoEntry) (labels : List String) (trigger : String)
@@ -43,15 +47,17 @@ inductive SourceConfig where
 
 instance : ToJson SourceConfig where
   toJson
-    | .githubIssues repos labels authorizedUsers =>
+    | .githubIssues repos labels trigger authorizedUsers =>
         Json.mkObj [("type", "github-issues"),
                     ("repos", ToJson.toJson repos),
                     ("labels", ToJson.toJson labels),
+                    ("trigger", trigger),
                     ("authorized_users", ToJson.toJson authorizedUsers)]
-    | .githubPrReviews repos labels authorizedUsers =>
+    | .githubPrReviews repos labels trigger authorizedUsers =>
         Json.mkObj [("type", "github-pr-reviews"),
                     ("repos", ToJson.toJson repos),
                     ("labels", ToJson.toJson labels),
+                    ("trigger", trigger),
                     ("authorized_users", ToJson.toJson authorizedUsers)]
     | .githubComments repos labels trigger authorizedUsers =>
         Json.mkObj [("type", "github-comments"),
@@ -80,13 +86,15 @@ instance : FromJson SourceConfig where
     | "github-issues" =>
         let repos          ← parseRepos j
         let labels          := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let trigger         := j.getObjValAs? String "trigger" |>.toOption |>.getD ""
         let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
-        return .githubIssues repos labels authorizedUsers
+        return .githubIssues repos labels trigger authorizedUsers
     | "github-pr-reviews" =>
         let repos          ← parseRepos j
         let labels          := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
+        let trigger         := j.getObjValAs? String "trigger" |>.toOption |>.getD ""
         let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
-        return .githubPrReviews repos labels authorizedUsers
+        return .githubPrReviews repos labels trigger authorizedUsers
     | "github-comments" =>
         let repos          ← parseRepos j
         let labels          := j.getObjValAs? (List String) "labels" |>.toOption |>.getD []
@@ -359,7 +367,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
     : IO (Array (String × List (String × String))) := do
   match source with
 
-  | .githubIssues repos labels sourceAuthorizedUsers => do
+  | .githubIssues repos labels trigger sourceAuthorizedUsers => do
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let labelParam := if labels.isEmpty then "" else "&labels=" ++ ",".intercalate labels
     let mut allEvents : Array (String × List (String × String)) := #[]
@@ -384,6 +392,8 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           if !isAuthorized allowed author then continue
           let title  := item.getObjValAs? String "title"    |>.toOption |>.getD ""
           let body   := item.getObjValAs? String "body"     |>.toOption |>.getD ""
+          -- If a trigger is set, skip issues whose body does not contain it
+          if !trigger.isEmpty && !(body.splitOn trigger).length > 1 then continue
           let url    := item.getObjValAs? String "html_url" |>.toOption |>.getD ""
           let vars   := [("issue_number", numStr), ("title", title), ("body", body),
                          ("url", url), ("author", author),
@@ -391,7 +401,7 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
           allEvents := allEvents.push (eventId, vars)
     return allEvents
 
-  | .githubPrReviews repos labels sourceAuthorizedUsers => do
+  | .githubPrReviews repos labels trigger sourceAuthorizedUsers => do
     let allowed := effectiveAllowed sourceAuthorizedUsers globalAuthorizedUsers
     let mut allEvents : Array (String × List (String × String)) := #[]
     for entry in repos do
@@ -433,6 +443,8 @@ def pollSource (source : SourceConfig) (state : ListenerState) (ghToken : String
             | some u => u.getObjValAs? String "login" |>.toOption |>.getD ""
           if !isAuthorized allowed reviewer then continue
           let body := review.getObjValAs? String "body" |>.toOption |>.getD ""
+          -- If a trigger is set, skip reviews whose body does not contain it
+          if !trigger.isEmpty && !(body.splitOn trigger).length > 1 then continue
           let url  := review.getObjValAs? String "html_url" |>.toOption |>.getD ""
           let vars := [
             ("pr_number",  toString prNum),
