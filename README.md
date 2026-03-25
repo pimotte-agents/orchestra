@@ -224,12 +224,6 @@ Fields:
 - `source.authorized_users` — list of GitHub logins that may trigger the listener; empty means allow everyone
 - `action.prompt_template` — template rendered with event variables (e.g. `{{upstream}}`, `{{fork}}`, `{{issue_number}}`, `{{body}}`, `{{author}}`)
 
-Start the listener daemon (requires the queue daemon to be running):
-
-```
-orchestra listener start
-```
-
 ## other commands
 
 ```
