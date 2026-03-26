@@ -1,6 +1,7 @@
 name = "orchestra"
 version = "0.1.0"
-defaultTargets = ["orchestra", "orchestra-mcp-test", "listener-config-test", "stream-format-test"]
+defaultTargets = ["orchestra", "orchestra-mcp-test"]
+testDriver = "orchestraTest"
 
 [[require]]
 name = "Cli"
@@ -9,6 +10,9 @@ rev = "main"
 
 [[lean_lib]]
 name = "Orchestra"
+
+[[lean_lib]]
+name = "Test"
 
 [[lean_exe]]
 name = "orchestra"
@@ -19,11 +23,5 @@ name = "orchestra-mcp-test"
 root = "McpTest"
 
 [[lean_exe]]
-name = "listener-config-test"
-root = "ListenerConfigTest"
-
-[[lean_exe]]
-name = "stream-format-test"
-root = "StreamFormatTest"
-
-
+name = "orchestraTest"
+root = "TestDriver"
