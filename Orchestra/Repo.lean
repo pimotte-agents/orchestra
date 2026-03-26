@@ -30,13 +30,22 @@ def splitRepo (s : String) : IO (String × String) := do
   | [owner, repo] => return (owner, repo)
   | _ => throw (.userError s!"invalid repo format '{s}', expected 'owner/repo'")
 
+/-- Build a GitHub clone URL, embedding the token for authenticated access when provided. -/
+private def githubUrl (repo : String) (token : Option String) : String :=
+  match token with
+  | none   => s!"https://github.com/{repo}.git"
+  | some t => s!"https://x-access-token:{t}@github.com/{repo}.git"
+
 /--
 Ensure the fork is cloned and the upstream remote is configured.
 Returns the path to the local repository.
 When `interactive` is false (e.g. queue mode), user prompts are suppressed and
 an error is thrown instead.
+Pass `token` to authenticate via a GitHub App installation token or PAT,
+which is required for private repositories.
 -/
-def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO System.FilePath := do
+def ensureCloned (fork upstream : String) (interactive : Bool := true)
+    (token : Option String := none) : IO System.FilePath := do
   let (forkOwner, forkRepo) ← splitRepo fork
   let base ← workDir
   let repoPath := base / forkOwner / forkRepo
@@ -47,8 +56,8 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
       IO.println s!"  Directory '{repoPath}' is empty; removing and re-cloning..."
       IO.FS.removeDirAll repoPath
       IO.FS.createDirAll repoPath
-      runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
-      runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+      runGit' #["clone", githubUrl fork token, repoPath.toString]
+      runGit' #["remote", "add", "upstream", githubUrl upstream token] repoPath
       return repoPath
     else
       -- Non-empty: verify it's a valid git repo
@@ -67,8 +76,8 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
         if answer == "y" || answer == "yes" then
           IO.FS.removeDirAll repoPath
           IO.FS.createDirAll repoPath
-          runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
-          runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+          runGit' #["clone", githubUrl fork token, repoPath.toString]
+          runGit' #["remote", "add", "upstream", githubUrl upstream token] repoPath
           return repoPath
         else
           throw (IO.userError s!"Directory '{repoPath}' is not a valid git repository. Remove it manually and try again.")
@@ -76,12 +85,12 @@ def ensureCloned (fork upstream : String) (interactive : Bool := true) : IO Syst
       let remotes ← runGit #["remote"] repoPath
       let hasUpstream := remotes.splitOn "\n" |>.any (· == "upstream")
       if !hasUpstream then
-        runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+        runGit' #["remote", "add", "upstream", githubUrl upstream token] repoPath
       return repoPath
   else
     IO.FS.createDirAll repoPath
-    runGit' #["clone", s!"https://github.com/{fork}.git", repoPath.toString]
-    runGit' #["remote", "add", "upstream", s!"https://github.com/{upstream}.git"] repoPath
+    runGit' #["clone", githubUrl fork token, repoPath.toString]
+    runGit' #["remote", "add", "upstream", githubUrl upstream token] repoPath
     return repoPath
 
 /-- Remove all cloned repositories. -/
