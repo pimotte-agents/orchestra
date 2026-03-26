@@ -47,6 +47,66 @@ instance : ToJson MemoryMode where
     | .project => "project"
     | .both    => "both"
 
+/-- The kind of authentication for an agent backend. -/
+inductive AuthKind where
+  /-- An OAuth token. -/
+  | oauthToken (token : String)
+  /-- An API key with an optional base URL. -/
+  | apiKey (key : String) (baseUrl : Option String := none)
+deriving Repr, Inhabited
+
+instance : FromJson AuthKind where
+  fromJson? j := do
+    -- Determine the kind from the fields present in the JSON object
+    if let .ok token := j.getObjValAs? String "oauth_token" then
+      return .oauthToken token
+    if let .ok key := j.getObjValAs? String "api_key" then
+      let baseUrl := j.getObjValAs? String "base_url" |>.toOption
+      return .apiKey key baseUrl
+    .error "expected \"oauth_token\" or \"api_key\" field"
+
+instance : ToJson AuthKind where
+  toJson
+    | .oauthToken token => Json.mkObj [("oauth_token", token)]
+    | .apiKey key baseUrl =>
+      let fields : List (String × Json) := [("api_key", key)]
+      let fields := match baseUrl with
+        | some url => fields ++ [("base_url", Json.str url)]
+        | none => fields
+      Json.mkObj fields
+
+/-- A single authentication source for an agent backend. -/
+structure AuthSource where
+  /-- Unique label identifying this source within its agent backend. -/
+  label : String
+  /-- The authentication kind and its credentials. -/
+  kind  : AuthKind
+deriving Repr, Inhabited
+
+instance : FromJson AuthSource where
+  fromJson? j := do
+    let label ← j.getObjValAs? String "label"
+    let kind ← @FromJson.fromJson? AuthKind _ j
+    return { label, kind }
+
+/-- Authentication source configuration for one agent backend. -/
+structure AgentAuthConfig where
+  /-- Backend name (e.g., `"claude"`, `"vibe"`). -/
+  name : String
+  /-- Available authentication sources for this backend. Labels must be unique. -/
+  authSources : Array AuthSource := #[]
+  /-- Label of the default authentication source.
+      If absent and exactly one source is configured, that source is used automatically. -/
+  defaultAuthSource : Option String := none
+deriving Repr, Inhabited
+
+instance : FromJson AgentAuthConfig where
+  fromJson? j := do
+    let name             ← j.getObjValAs? String "name"
+    let authSources       := j.getObjValAs? (Array AuthSource) "auth_sources" |>.toOption |>.getD #[]
+    let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
+    return { name, authSources, defaultAuthSource }
+
 structure Task where
   upstream : String
   fork : String
@@ -62,6 +122,9 @@ structure Task where
   budget : Option Float := none
   /-- Which memory directories to make available to the agent. Defaults to `both`. -/
   memory : MemoryMode := .both
+  /-- Label of the authentication source to use for this task.
+      Must match a label in the agent's `auth_sources` config. -/
+  authSource : Option String := none
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -76,7 +139,9 @@ instance : FromJson Task where
     let model := j.getObjValAs? String "model" |>.toOption
     let budget := j.getObjValAs? Float "budget" |>.toOption
     let memory := j.getObjValAs? MemoryMode "memory" |>.toOption |>.getD .both
-    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory }
+    let authSource := j.getObjValAs? String "auth_source" |>.toOption
+    return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
+             authSource }
 
 structure AppConfig where
   appId : Nat
@@ -96,6 +161,9 @@ structure AppConfig where
   /-- GitHub logins allowed to trigger any listener. Empty = allow everyone.
       Can be overridden per listener via `authorized_users` in the source config. -/
   authorizedUsers : List String := []
+  /-- Per-backend authentication source configurations.
+      Allows configuring multiple named authentication sources for each agent backend. -/
+  agentAuthConfigs : Array AgentAuthConfig := #[]
 deriving Repr
 
 instance : FromJson AppConfig where
@@ -114,8 +182,10 @@ instance : FromJson AppConfig where
     let anthropicBaseUrl := j.getObjValAs? String "anthropic_base_url" |>.toOption
     let anthropicAuthToken := j.getObjValAs? String "anthropic_auth_token" |>.toOption
     let authorizedUsers := j.getObjValAs? (List String) "authorized_users" |>.toOption |>.getD []
+    let agentAuthConfigs := j.getObjValAs? (Array AgentAuthConfig) "agents" |>.toOption |>.getD #[]
     return { appId, privateKeyPath, installationId, pat, pluginDirs,
-             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers }
+             claudeToken, anthropicApiKey, anthropicBaseUrl, anthropicAuthToken, authorizedUsers,
+             agentAuthConfigs }
 
 structure TaskFile where
   tasks : Array Task
