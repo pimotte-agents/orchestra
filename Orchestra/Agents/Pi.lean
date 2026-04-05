@@ -50,11 +50,16 @@ private def piParseOutputLine (line : String) : Option Event :=
       match piJStr ame "type" with
       | "text_delta" =>
         let delta := piJStr ame "delta"
-        if delta.isEmpty then none else some (.assistant (.text delta))
+        if delta.isEmpty then
+          some (.unknown s!"message_update text_delta (empty delta) ame={ame.compress}")
+        else some (.assistant (.text delta))
       | "thinking_delta" =>
         let delta := piJStr ame "delta"
-        if delta.isEmpty then none else some (.assistant (.thinking delta))
-      | _ => none
+        if delta.isEmpty then
+          some (.unknown s!"message_update thinking_delta (empty delta)")
+        else some (.assistant (.thinking delta))
+      | other =>
+        some (.unknown s!"message_update ame.type={other} ame={ame.compress}")
     | "tool_execution_start" =>
       let toolName := piJStr json "toolName"
       let args := piJVal json "args" |>.getD (Json.mkObj [])
@@ -66,7 +71,7 @@ private def piParseOutputLine (line : String) : Option Event :=
       if isError then
         some (.toolResult "" text)
       else if text.isEmpty then
-        none
+        some (.unknown s!"tool_execution_end (empty result) raw={result.compress}")
       else
         some (.toolResult text "")
     | "agent_end" =>
@@ -86,7 +91,7 @@ private def piParseOutputLine (line : String) : Option Event :=
       let aborted := json.getObjValAs? Bool "aborted" |>.toOption |>.getD false
       let reason  := piJStr json "reason"
       some (.unknown s!"compaction_end aborted={aborted} reason={reason}")
-    | _ => none
+    | other => some (.unknown s!"pi_event type={other} raw={line.trimAscii.toString}")
 
 /-- The pi coding agent backend (https://github.com/badlogic/pi-mono). -/
 def pi : AgentDef where
