@@ -40,6 +40,10 @@ private def piParseOutputLine (line : String) : Option Event :=
     | "session" =>
       -- First line: {"type":"session","version":3,"id":"uuid","cwd":"..."}
       some (.init (piJStr json "id") "")
+    -- Lifecycle events surfaced for debug visibility
+    | "agent_start" => some (.unknown "agent_start")
+    | "turn_start"  => some (.unknown "turn_start")
+    | "turn_end"    => some (.unknown "turn_end")
     | "message_update" =>
       -- Streaming assistant content deltas
       let ame := piJVal json "assistantMessageEvent" |>.getD (Json.mkObj [])
@@ -66,7 +70,22 @@ private def piParseOutputLine (line : String) : Option Event :=
       else
         some (.toolResult text "")
     | "agent_end" =>
-      some (.result .success none none none "")
+      -- Use the number of messages in the transcript as a proxy for numTurns
+      let msgCount := match json.getObjVal? "messages" with
+        | .ok (.arr a) => some a.size
+        | _ => none
+      some (.result .success msgCount none none "")
+    | "auto_retry_start" =>
+      let attempt := json.getObjValAs? Nat "attempt" |>.toOption |>.getD 0
+      let msg     := piJStr json "errorMessage"
+      some (.unknown s!"auto_retry attempt={attempt} reason={msg}")
+    | "compaction_start" =>
+      let reason := piJStr json "reason"
+      some (.unknown s!"compaction_start reason={reason}")
+    | "compaction_end" =>
+      let aborted := json.getObjValAs? Bool "aborted" |>.toOption |>.getD false
+      let reason  := piJStr json "reason"
+      some (.unknown s!"compaction_end aborted={aborted} reason={reason}")
     | _ => none
 
 /-- The pi coding agent backend (https://github.com/badlogic/pi-mono). -/
@@ -84,7 +103,9 @@ def pi : AgentDef where
   setupMcp _port _model _systemPrompt :=
     return ("", #[("PI_SKIP_VERSION_CHECK", some "1")])
   buildArgs _ctx _pluginDirs _subAgent model systemPrompt resume _budget prompt := Id.run do
-    let mut args : Array String := #["--mode", "json"]
+    -- --print makes pi non-interactive (process prompt and exit);
+    -- without it pi starts in interactive mode and exits immediately when stdin is /dev/null.
+    let mut args : Array String := #["--print", "--mode", "json"]
     if let some m := model then
       args := args.push "--model" |>.push m
     if let some content := systemPrompt then
