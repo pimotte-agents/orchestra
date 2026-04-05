@@ -44,6 +44,17 @@ private def piParseOutputLine (line : String) : Option Event :=
     | "agent_start" => some (.unknown "agent_start")
     | "turn_start"  => some (.unknown "turn_start")
     | "turn_end"    => some (.unknown "turn_end")
+    | "message_start" | "message_end" =>
+      -- Extract provider, api, model, and errorMessage for visibility
+      let evType := piJStr json "type"
+      let msg  := piJVal json "message" |>.getD (Json.mkObj [])
+      let api      := piJStr msg "api"
+      let provider := piJStr msg "provider"
+      let model    := piJStr msg "model"
+      let errMsg   := piJStr msg "errorMessage"
+      let info := String.intercalate " " ([s!"api={api}", s!"provider={provider}", s!"model={model}"]
+        ++ if errMsg.isEmpty then [] else [s!"error={errMsg}"])
+      some (.unknown s!"{evType} {info}")
     | "message_update" =>
       -- Streaming assistant content deltas
       let ame := piJVal json "assistantMessageEvent" |>.getD (Json.mkObj [])
@@ -106,7 +117,26 @@ def pi : AgentDef where
   }
   -- Pi does not have native MCP support.  Return an empty context and inject
   -- PI_SKIP_VERSION_CHECK so the sandbox startup is quiet.
-  setupMcp _port _model _systemPrompt :=
+  -- Also log pi's config files so the configured API base URL is visible.
+  setupMcp _port _model _systemPrompt := do
+    let err ← IO.getStderr
+    -- Try to read pi's config directory for API endpoint info
+    if let some home ← IO.getEnv "HOME" then do
+      let piDir := System.FilePath.mk home / ".pi"
+      if ← piDir.pathExists then
+        let entries ← try System.FilePath.readDir piDir catch _ => pure #[]
+        let jsonFiles := entries.filter (fun e => e.fileName.endsWith ".json")
+        if jsonFiles.isEmpty then
+          err.putStrLn s!"[pi] config dir {piDir} exists but contains no .json files"
+        for entry in jsonFiles do
+          let path := piDir / entry.fileName
+          let contents ← try IO.FS.readFile path catch _ => pure "(unreadable)"
+          err.putStrLn s!"[pi] config {path}: {contents.trimAscii}"
+      else
+        err.putStrLn s!"[pi] config dir {piDir} does not exist"
+    else
+      err.putStrLn "[pi] WARNING: HOME not set, cannot read pi config"
+    err.flush
     return ("", #[("PI_SKIP_VERSION_CHECK", some "1")])
   buildArgs _ctx _pluginDirs _subAgent model systemPrompt resume _budget prompt := Id.run do
     -- --print makes pi non-interactive (process prompt and exit);
