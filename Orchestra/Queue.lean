@@ -64,6 +64,9 @@ structure QueueEntry where
   tools         : Option (List String) := none
   /-- If true, the project folder is mounted read-only in the sandbox. -/
   readOnly      : Bool := false
+  /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
+      Appended to the ports the agent backend already opens (MCP server port + 443). -/
+  extraPorts    : Array Nat := #[]
 deriving Repr
 
 instance : ToJson QueueEntry where
@@ -90,6 +93,7 @@ instance : ToJson QueueEntry where
     let fields := if let some s := e.authSource    then fields ++ [("auth_source",     Json.str s)]      else fields
     let fields := if let some t := e.tools         then fields ++ [("tools",           ToJson.toJson t)] else fields
     let fields := if e.readOnly                    then fields ++ [("read_only",        Json.bool true)]  else fields
+    let fields := if !e.extraPorts.isEmpty         then fields ++ [("extra_ports",      ToJson.toJson e.extraPorts)] else fields
     Json.mkObj fields
 
 instance : FromJson QueueEntry where
@@ -114,9 +118,10 @@ instance : FromJson QueueEntry where
     let authSource    := j.getObjValAs? String "auth_source" |>.toOption
     let tools         := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly      := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
+    let extraPorts    := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
     return { id, createdAt, status, upstream, fork, mode, prompt,
              agent, systemPrompt, backend, model, continuesFrom, series, taskId, configPath,
-             budget, memory, authSource, tools, readOnly }
+             budget, memory, authSource, tools, readOnly, extraPorts }
 
 -- Directories and paths
 
