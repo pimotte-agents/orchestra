@@ -162,35 +162,21 @@ def appConfigDefaultAuthorizedUsers : Test := do
       (msg := "authorizedUsers default empty")
 
 @[test]
-def actionConfigExtraPorts : Test := do
+def agentAuthConfigExtraPorts : Test := do
   let json := r#"
-    {"upstream": "org/repo", "fork": "my-fork/repo", "mode": "pr",
-     "prompt_template": "do the thing",
-     "extra_ports": [8080, 9090]}
+    {"name": "claude", "extra_ports": [8080, 9090]}
   "#
-  match Json.parse json >>= FromJson.fromJson? (α := ActionConfig) with
-  | .error e => TestM.fail s!"ActionConfig extra_ports parse: {e}"
+  match Json.parse json >>= FromJson.fromJson? (α := AgentAuthConfig) with
+  | .error e => TestM.fail s!"AgentAuthConfig extra_ports parse: {e}"
   | .ok cfg =>
     TestM.assertEqual cfg.extraPorts #[8080, 9090] (msg := "extraPorts")
 
 @[test]
-def actionConfigExtraPortsDefault : Test := do
+def agentAuthConfigExtraPortsDefault : Test := do
   let json := r#"
-    {"upstream": "org/repo", "fork": "my-fork/repo", "mode": "pr",
-     "prompt_template": "do the thing"}
+    {"name": "claude"}
   "#
-  match Json.parse json >>= FromJson.fromJson? (α := ActionConfig) with
-  | .error e => TestM.fail s!"ActionConfig no extra_ports: {e}"
+  match Json.parse json >>= FromJson.fromJson? (α := AgentAuthConfig) with
+  | .error e => TestM.fail s!"AgentAuthConfig no extra_ports: {e}"
   | .ok cfg =>
     TestM.assertEqual cfg.extraPorts (#[] : Array Nat) (msg := "extraPorts default empty")
-
-@[test]
-def actionConfigExtraPortsRoundTrip : Test := do
-  let cfg : ActionConfig := {
-    upstream := "org/repo", fork := "my-fork/repo", mode := .pr,
-    promptTemplate := "do the thing", extraPorts := #[3000, 5000]
-  }
-  match FromJson.fromJson? (ToJson.toJson cfg) (α := ActionConfig) with
-  | .error e => TestM.fail s!"ActionConfig extra_ports round-trip: {e}"
-  | .ok got =>
-    TestM.assertEqual got.extraPorts #[3000, 5000] (msg := "extraPorts round-trip")

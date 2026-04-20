@@ -220,6 +220,8 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       | _           => AgentDef.claude
     let backendName := task.backend.getD "claude"
     let apiKeyEnv ← resolveAuthEnv appConfig agentDef backendName task.authSource
+    let extraPorts := appConfig.agentAuthConfigs.find? (fun c => c.name == backendName)
+      |>.map (·.extraPorts) |>.getD #[]
     let debugLogFile : Option System.FilePath ←
       if debug then
         let suffix := if attempt == 0 then "" else s!".retry{attempt}"
@@ -237,7 +239,7 @@ private def runTask (appConfig : AppConfig) (task : Task) (idx : Nat) (debug : B
       (subAgent := task.agent) (model := task.model) (systemPrompt := systemPrompt)
       (resume := resume) (budget := task.budget.getD 4.0) (cancelToken := cancelToken)
       (extraEnv := apiKeyEnv) (debugLogFile := debugLogFile) (logFile := taskLogFile)
-      (readOnly := task.readOnly) (extraPorts := task.extraPorts)
+      (readOnly := task.readOnly) (extraPorts := extraPorts)
     IO.println s!"  Agent exited with code {result.exitCode}"
     sessionId := result.sessionId
     lastResultSubtype := result.resultSubtype
@@ -548,7 +550,6 @@ private def enqueueHandler (p : Parsed) : IO UInt32 := do
         authSource   := task.authSource
         tools        := task.tools
         readOnly     := task.readOnly
-        extraPorts   := task.extraPorts
       }
       Queue.saveEntry entry
       IO.println entry.id
@@ -673,7 +674,6 @@ private def queueStartHandler (p : Parsed) : IO UInt32 := do
         authSource   := entry.authSource
         tools        := entry.tools
         readOnly     := entry.readOnly
-        extraPorts   := entry.extraPorts
       }
       let cfg ← match entry.configPath with
         | none    => pure appConfig

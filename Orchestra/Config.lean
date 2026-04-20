@@ -98,6 +98,9 @@ structure AgentAuthConfig where
   /-- Label of the default authentication source.
       If absent and exactly one source is configured, that source is used automatically. -/
   defaultAuthSource : Option String := none
+  /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
+      Appended to the ports the agent backend already opens (MCP server port + 443). -/
+  extraPorts : Array Nat := #[]
 deriving Repr, Inhabited
 
 instance : FromJson AgentAuthConfig where
@@ -105,7 +108,8 @@ instance : FromJson AgentAuthConfig where
     let name             ← j.getObjValAs? String "name"
     let authSources       := j.getObjValAs? (Array AuthSource) "auth_sources" |>.toOption |>.getD #[]
     let defaultAuthSource := j.getObjValAs? String "default_auth_source" |>.toOption
-    return { name, authSources, defaultAuthSource }
+    let extraPorts        := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
+    return { name, authSources, defaultAuthSource, extraPorts }
 
 structure Task where
   upstream : String
@@ -136,9 +140,6 @@ structure Task where
   /-- If true, the project folder is mounted read-only in the sandbox.
       Useful for tasks that should only read the codebase (e.g. review tasks). -/
   readOnly : Bool := false
-  /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
-      Appended to the ports the agent backend already opens (MCP server port + 443). -/
-  extraPorts : Array Nat := #[]
 deriving Repr, Inhabited
 
 instance : FromJson Task where
@@ -156,9 +157,8 @@ instance : FromJson Task where
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
-    let extraPorts := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
     return { upstream, fork, mode, prompt, agent, systemPrompt, backend, model, budget, memory,
-             authSource, tools, readOnly, extraPorts }
+             authSource, tools, readOnly }
 
 structure AppConfig where
   appId : Nat

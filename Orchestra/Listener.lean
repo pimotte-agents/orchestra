@@ -134,9 +134,6 @@ structure ActionConfig where
   tools          : Option (List String) := none
   /-- If true, the project folder is mounted read-only in the sandbox. -/
   readOnly       : Bool := false
-  /-- Additional TCP ports the agent is allowed to connect to inside the sandbox.
-      Appended to the ports the agent backend already opens (MCP server port + 443). -/
-  extraPorts     : Array Nat := #[]
 
 instance : ToJson ActionConfig where
   toJson a :=
@@ -157,7 +154,6 @@ instance : ToJson ActionConfig where
     let fields := if let some s := a.authSource   then fields ++ [("auth_source",   Json.str s)]      else fields
     let fields := if let some t := a.tools        then fields ++ [("tools",         ToJson.toJson t)] else fields
     let fields := if a.readOnly                   then fields ++ [("read_only",      Json.bool true)]  else fields
-    let fields := if !a.extraPorts.isEmpty        then fields ++ [("extra_ports",    ToJson.toJson a.extraPorts)] else fields
     Json.mkObj fields
 
 instance : FromJson ActionConfig where
@@ -184,9 +180,8 @@ instance : FromJson ActionConfig where
     let authSource := j.getObjValAs? String "auth_source" |>.toOption
     let tools := j.getObjValAs? (List String) "tools" |>.toOption
     let readOnly := j.getObjValAs? Bool "read_only" |>.toOption |>.getD false
-    let extraPorts := j.getObjValAs? (Array Nat) "extra_ports" |>.toOption |>.getD #[]
     return { upstream, fork, mode, promptTemplate, series, backend, model, agent, systemPrompt,
-             budget, memory, authSource, tools, readOnly, extraPorts }
+             budget, memory, authSource, tools, readOnly }
 
 -- Listener config
 
@@ -328,7 +323,6 @@ def buildQueueEntry (action : ActionConfig) (vars : List (String × String)) : I
     authSource   := action.authSource
     tools        := action.tools
     readOnly     := action.readOnly
-    extraPorts   := action.extraPorts
   }
 
 -- GitHub helpers
